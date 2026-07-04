@@ -1,0 +1,80 @@
+{
+  "company": "Notion",
+  "industry": "productivity software",
+  "competitors": [
+    {"name": "ClickUp", "description": "All-in-one work management platform combining tasks, docs, goals and chat; the most aggressive feature-bundler in the space and Notion's most frequent head-to-head rival in team deployments.", "website": "https://clickup.com", "confidence": 97},
+    {"name": "Coda", "description": "Doc-meets-database platform known for powerful formulas and building-block flexibility; now operating inside the Superhuman/Grammarly family, which is reshaping its roadmap and unsettling some long-time customers.", "website": "https://coda.io", "confidence": 95},
+    {"name": "Airtable", "description": "No-code relational database and app-building platform led by co-founder CEO Howie Liu; overlaps with Notion wherever teams manage structured data, pipelines and lightweight internal tools.", "website": "https://airtable.com", "confidence": 93},
+    {"name": "Obsidian", "description": "Local-first, markdown-based knowledge base repeatedly cited by ex-Notion users (r/productivity) as the top switching destination for speed, offline access and data ownership — free for personal use.", "website": "https://obsidian.md", "confidence": 92},
+    {"name": "Evernote", "description": "The veteran note-taking product, still a common comparison point for individual and small-team knowledge capture despite losing mindshare to newer tools.", "website": "https://evernote.com", "confidence": 85},
+    {"name": "Atlassian (Confluence)", "description": "Enterprise wiki and collaboration suite listed by Gartner as a top Notion alternative; the default incumbent inside engineering-led organizations already paying for Jira.", "website": "https://www.atlassian.com", "confidence": 84},
+    {"name": "Tana", "description": "AI-native networked note tool that turns daily notes into structured knowledge hubs; small but growing among the power-user segment Notion originally won.", "website": "https://tana.inc", "confidence": 78},
+    {"name": "Anytype", "description": "Object-based, local-first and end-to-end encrypted Notion alternative pitched directly at privacy-conscious users uncomfortable with cloud-only workspaces.", "website": "https://anytype.io", "confidence": 76}
+  ],
+  "leads": [
+    {"name": "Ivan Zhao", "role": "Co-founder & CEO", "company": "Notion", "linkedin_url": "https://www.linkedin.com/in/ivanhzhao", "snippet": "Founder at Notion · San Francisco · 31.6K+ followers", "is_target_company": true},
+    {"name": "Akshay Kothari", "role": "Co-founder", "company": "Notion", "linkedin_url": "https://www.linkedin.com/in/akothari", "snippet": "Building Notion", "is_target_company": true},
+    {"name": "Katy Shields", "role": "Chief People Officer", "company": "Notion", "linkedin_url": "https://www.linkedin.com/in/katyshields", "snippet": "Chief People Officer at Notion // Board member", "is_target_company": true},
+    {"name": "Geoff Brooks", "role": "Head of Business Operations", "company": "Notion", "linkedin_url": "https://www.linkedin.com/in/geoffreyibrooks", "snippet": "Leads Business Operations at Notion, strategic partner to CXO-level executives on corporate strategy and AI programs.", "is_target_company": true},
+    {"name": "Anna O'Connell", "role": "Head of Services", "company": "Notion", "linkedin_url": "https://www.linkedin.com/in/anna-o-connell", "snippet": "Head of Services @ Notion", "is_target_company": true},
+    {"name": "Zeb Evans", "role": "Founder & CEO", "company": "ClickUp", "linkedin_url": "https://www.linkedin.com/in/zebevansclickup", "snippet": "Founder & CEO at ClickUp · 62K+ followers", "is_target_company": false},
+    {"name": "Chris Cunningham", "role": "Founding Member, Marketing", "company": "ClickUp", "linkedin_url": "https://www.linkedin.com/in/chrisclickup", "snippet": "Leads ClickUp's content-led social strategy generating 200M impressions/month.", "is_target_company": false},
+    {"name": "Lane Shackleton", "role": "Head of Coda", "company": "Coda", "linkedin_url": "https://www.linkedin.com/in/laneshackleton", "snippet": "Head of Coda", "is_target_company": false},
+    {"name": "Howie Liu", "role": "Co-founder & CEO", "company": "Airtable", "linkedin_url": "https://www.linkedin.com/in/howieliu", "snippet": "CEO, Airtable", "is_target_company": false},
+    {"name": "Emmett Nicholas", "role": "Co-founder", "company": "Airtable", "linkedin_url": "https://www.linkedin.com/in/emmett-nicholas", "snippet": "Co-founder at Airtable", "is_target_company": false}
+  ],
+  "positioning": {
+    "website": "https://www.notion.com",
+    "tagline": "The AI workspace that works for you. | Notion",
+    "description": "Notion Agent — you assign the tasks, Notion Agent does the work.",
+    "h1": "Notion Agent"
+  },
+  "trends": {
+    "stats": [
+      "The productivity software market will grow from $74.94 billion in 2025 to $86.86 billion in 2026 (The Business Research Company).",
+      "Business productivity software is set to grow from $100.5 billion in 2026 to $249.9 billion by 2033, a 13.9% CAGR (Persistence Market Research).",
+      "The broader software market is projected to grow from $926.34 billion in 2026 to $2,212.21 billion by 2034 at 11.5% CAGR (Fortune Business Insights)."
+    ],
+    "risks": [
+      "Notion locked unlimited AI and enterprise search behind its $20/user/month Business plan, prompting users to evaluate cheaper alternatives and standalone LLMs.",
+      "Organizations report data security, hallucinations, and unauthorized data exposure as primary risks of workspace AI agents (2026 enterprise governance coverage).",
+      "Notion shut down Notion Mail in mid-2026 as users shifted email handling to AI agents — evidence that agents are absorbing adjacent product categories."
+    ]
+  },
+  "report": {
+    "summary": "Notion enters the second half of 2026 from a position of scale — 100M+ users, roughly $600M in ARR (more than half now tied to AI features), and a valuation reported between $10–11B — but the category it defined is being redefined underneath it. The productivity software market is expanding from $74.9B (2025) to $86.9B (2026), yet the growth is flowing toward AI-agent workflows rather than manually structured workspaces. Notion's own homepage now leads with 'Notion Agent — you assign the tasks, Notion Agent does the work,' a bet-the-company repositioning. Meanwhile its competitive set has split in two directions: feature-bundlers (ClickUp, Atlassian) attacking from above, and local-first/AI-native tools (Obsidian, Anytype, Tana) siphoning the prosumer base from below. Coda's absorption into the Superhuman/Grammarly organization removes one independent rival but creates a new, better-funded one.",
+    "growth": [
+      {"title": "Convert the agent head-start into an enterprise moat", "detail": "Over half of Notion's ~$600M ARR is already AI-attached — a lead none of ClickUp, Airtable or Confluence can claim. But enterprise buyers currently cite the credits-based agent pricing as hard to budget. If Notion ships predictable, flat-rate agent pricing with admin-grade governance controls before renewal season, it converts its AI adoption lead into multi-year enterprise contracts that are structurally hard for bundlers to displace."},
+      {"title": "Run a migration offensive against a destabilized Coda", "detail": "Coda's move into the Superhuman/Grammarly family has long-time customers uncertain about roadmap continuity — its founding CEO Shishir Mehrotra now runs Superhuman, and Coda is led by Lane Shackleton under a parent with different priorities. Doc-database power users are the easiest Notion converts in the market. A dedicated Coda import tool, formula-compatibility layer and 'Coda migration' landing pages could capture this cohort in the next two quarters while the uncertainty window is open."},
+      {"title": "Ride the 13–16% category tailwind with verticalized agents", "detail": "The business productivity market is forecast to grow from $100.5B (2026) to $249.9B by 2033 at 13.9% CAGR. The share Notion captures depends on beating AI-native upstarts (Stratpilot-style 'AI business OS' products) to vertical use cases. Packaged agent templates for the functions where Notion already has distribution — startups, product teams, marketing ops — turn generic seat expansion into use-case-led expansion, the cheapest growth available given 100M users are already in the funnel."}
+    ],
+    "risks": [
+      {"title": "AI-native disruption from below — and from general-purpose LLMs", "detail": "The sharpest 2026 criticism is that AI agents make manual workspace structuring unnecessary: standalone LLMs like ChatGPT and Claude, plus AI-native tools (Taskade Genesis, Stratpilot, Tana), do the job without Notion's setup cost. Notion's own shutdown of Notion Mail — because 'users rely on AI agents for managing emails' — is proof the dynamic is real and already eating adjacent products. If agents commoditize the workspace itself, Notion's core asset becomes an interface competitors can bypass."},
+      {"title": "Enterprise governance backlash against workspace agents", "detail": "2026 enterprise coverage repeatedly flags data security, hallucinations and unauthorized data exposure as the primary risks of letting AI agents act across company databases. Notion's growth thesis depends on exactly that behavior. One high-profile data-exposure incident — at Notion or any workspace-agent vendor — could freeze enterprise agent budgets for several quarters and stall the AI-attached revenue that now underpins more than half of ARR."},
+      {"title": "Pricing revolt pushing the base toward free, local-first rivals", "detail": "Gating unlimited AI behind the $20/user/month Business plan triggered visible user backlash, and the credits system for Custom Agents is described by organizations as difficult to budget. Meanwhile Obsidian is free and local, Anytype is encrypted and local-first, and ClickUp bundles AI into a broader suite. Notion's prosumer base — the engine of its bottom-up enterprise motion — is the segment most price-sensitive and most courted by these alternatives. Erosion there quietly cuts off the pipeline that made Notion's sales model work."}
+    ]
+  },
+  "sources": [
+    "https://zapier.com/blog/notion-alternatives/",
+    "https://www.gartner.com/reviews/market/document-collaboration-tools/vendor/notion/alternatives",
+    "https://www.zoho.com/tables/best-notion-alternatives.html",
+    "https://www.teamwork.com/blog/notion-alternatives/",
+    "https://www.reddit.com/r/productivity/",
+    "https://www.notion.com",
+    "https://www.thebusinessresearchcompany.com/report/productivity-software-global-market-report",
+    "https://www.persistencemarketresearch.com/market-research/business-productivity-software-market.asp",
+    "https://www.fortunebusinessinsights.com/software-market-102630",
+    "https://www.mordorintelligence.com/industry-reports/business-productivity-software-market",
+    "https://www.taskade.com/blog/notion-review/",
+    "https://lcntech.com/news/notion-mail-shuts-down-ai-agents",
+    "https://stratpilot.ai/blog/notion-vs-ai-business-os",
+    "https://techjacksolutions.com/what-is-notion-ai/",
+    "https://tracxn.com/d/companies/notion",
+    "https://www.linkedin.com/in/ivanhzhao",
+    "https://www.linkedin.com/in/zebevansclickup",
+    "https://www.linkedin.com/in/howieliu",
+    "https://www.linkedin.com/in/laneshackleton"
+  ],
+  "cached": false,
+  "researched_at": 0
+}
