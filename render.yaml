@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: leadlens
+    runtime: docker
+    plan: free
+    healthCheckPath: /api/history
+    envVars:
+      - key: BRAVE_API_KEY   # optional but recommended: free key from brave.com/search/api
+        sync: false
