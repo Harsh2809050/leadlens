@@ -442,13 +442,21 @@ def detect_industry(company):
         m = anchored.search(r["title"] + ". " + r["snippet"])
         if m:
             phrase = m.group(1).strip().lower()
-            phrase = re.sub(r"^(american|indian|british|german|french|chinese|"
-                            r"japanese|multinational|global|leading|popular|"
-                            r"proprietary|free|online|web.based)\s+", "", phrase)
+            # never echo the company's own name inside its industry label
+            phrase = phrase.replace(company.lower(), " ")
+            phrase = re.sub(r"^(?:(?:american|indian|british|german|french|"
+                            r"chinese|japanese|multinational|global|leading|"
+                            r"popular|proprietary|free|online|web.based|the)"
+                            r"\s+)+", "", phrase)
+            phrase = re.sub(r"\s+", " ", phrase).strip(" -,.")
             if 4 <= len(phrase) <= 60:
                 # prefer what comes after "for" ("web application for interface design")
-                tail = phrase.split(" for ")[-1]
-                return (tail if 4 <= len(tail) <= 40 else phrase)[:40]
+                tail = phrase.split(" for ")[-1].strip()
+                cand = tail if 4 <= len(tail) <= 40 else phrase
+                if len(cand) > 40:  # cut at a word boundary, never mid-word
+                    cand = cand[:40].rsplit(" ", 1)[0]
+                if len(cand) >= 4:
+                    return cand
 
     if scores[best] > 0:
         return best
