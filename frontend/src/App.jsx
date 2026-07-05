@@ -4,7 +4,7 @@ const LOADING_STEPS = [
   "Identifying the company's industry…",
   "Scanning the web for direct competitors…",
   "Verifying competitor companies…",
-  "Finding decision makers on LinkedIn…",
+  "Finding prospective buyers on LinkedIn…",
   "Reading company positioning…",
   "Pulling industry trends and market data…",
   "Writing the intelligence report…",
@@ -354,7 +354,7 @@ export default function App() {
               <SectionHeader
                 index="2"
                 title="Potential Leads"
-                subtitle="Decision makers found via LinkedIn across the competitive set"
+                subtitle="Prospective buyers worldwide whose job titles match this product's customer profile"
                 count={data.leads.length}
               />
               {data.leads.length ? (
