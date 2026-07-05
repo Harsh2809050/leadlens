@@ -45,16 +45,17 @@ def _lock_for(key):
 def run_research(company: str, industry: str) -> dict:
     """Full live research pipeline. Returns the complete payload."""
     sources = []
-
-    competitors, comp_sources = research.find_competitors(company, industry)
-    sources.extend(comp_sources)
-
-    leads, lead_sources = research.find_leads(company, industry, competitors)
-    sources.extend(lead_sources)
+    research.set_deadline(150)  # hard budget: return what we have, never spin
 
     positioning = research.get_positioning(company, industry)
     if positioning.get("website"):
         sources.append(positioning["website"])
+
+    competitors, comp_sources = research.find_competitors(company, industry)
+    sources.extend(comp_sources)
+
+    leads, lead_sources = research.find_leads(company, industry, positioning)
+    sources.extend(lead_sources)
 
     trends = research.get_trends(company, industry)
     sources.extend(trends.get("sources", []))

@@ -306,6 +306,17 @@ if BRAVE_API_KEY:
 _preferred_engine = [None]  # promotes the engine that last worked
 _serp_cache = {}            # query -> results, avoids repeat hits in one run
 _engine_fails = {}          # engine -> consecutive errors; 3+ = skip (circuit breaker)
+_deadline = [None]          # global time budget for one research run
+
+
+def set_deadline(seconds):
+    """Cap a research run: past the deadline all searches return empty and
+    the pipeline finishes with whatever it has instead of spinning forever."""
+    _deadline[0] = time.time() + seconds
+
+
+def out_of_time():
+    return _deadline[0] is not None and time.time() > _deadline[0]
 
 
 def web_search(query, max_results=10):
@@ -313,8 +324,10 @@ def web_search(query, max_results=10):
     Slow cadence + one retry pass: search engines rate-limit fast crawlers."""
     if query in _serp_cache:
         return _serp_cache[query][:max_results]
+    if out_of_time():
+        return []
     for attempt in (1, 2):
-        time.sleep(random.uniform(1.5, 2.5))  # polite pace beats rate limits
+        time.sleep(random.uniform(0.7, 1.2))  # polite pace beats rate limits
         order = list(ENGINES)
         if _preferred_engine[0]:
             order.sort(key=lambda e: e[0] != _preferred_engine[0])
@@ -336,9 +349,11 @@ def web_search(query, max_results=10):
                       flush=True)
                 return res
         if attempt == 1:
-            print(f"[search] all engines empty for {query!r}; backing off 15s",
+            if out_of_time():
+                break
+            print(f"[search] all engines empty for {query!r}; backing off 5s",
                   flush=True)
-            time.sleep(15)
+            time.sleep(5)
     _serp_cache[query] = []
     return []
 
@@ -417,8 +432,14 @@ def detect_industry(company):
         return best
 
     # "Figma is a collaborative web application for interface design..."
+    # anchored to the company name so a stray "Wikipedia is a free online
+    # encyclopedia" snippet can never hijack the industry
+    anchored = re.compile(
+        re.escape(company) + r"[^.]{0,50}?\bis an? ([a-z][a-z ,/&\-]{4,70}?)"
+        r"(?:\.|,| that| which| developed| founded| headquartered| based|"
+        r" owned| primarily| used )", re.I)
     for r in rs:
-        m = _IS_A_PAT.search(r["snippet"]) or _IS_A_PAT.search(r["title"])
+        m = anchored.search(r["title"] + ". " + r["snippet"])
         if m:
             phrase = m.group(1).strip().lower()
             phrase = re.sub(r"^(american|indian|british|german|french|chinese|"
@@ -525,23 +546,48 @@ def find_competitors(company, industry, max_competitors=8, progress=None):
 
     ranked = _mine_candidates(texts, company)
     # keep only candidates seen with meaningful support
-    ranked = [(n, s) for n, s in ranked if s >= 3][: max_competitors + 6]
+    ranked = [(n, s) for n, s in ranked if s >= 3][: max_competitors + 4]
     print(f"[competitors] candidates: {[(n, s) for n, s in ranked]}", flush=True)
 
     competitors = []
     for name, score in ranked:
-        if len(competitors) >= max_competitors:
+        if len(competitors) >= max_competitors or out_of_time():
             break
         verified, desc, website = verify_competitor(name, company, industry)
         print(f"[verify] {name}: {'OK' if verified else 'dropped'}", flush=True)
         if not verified:
-            continue  # no head-to-head evidence on the web — drop it
+            continue
         competitors.append({
             "name": name,
             "description": desc,
             "website": website,
             "confidence": min(99, 55 + score * 3),
         })
+
+    # Small/unknown company fallback: no head-to-head pages exist on the web,
+    # so pull the leading players of the same industry as the competitive set.
+    if len(competitors) < 3 and not out_of_time():
+        print(f"[competitors] falling back to category search for {industry}",
+              flush=True)
+        rs = web_search(f"top {industry} companies", 10)
+        rs += web_search(f"best {industry} platforms", 8)
+        cat_texts = [(2, r["title"]) for r in rs] + [(1, r["snippet"]) for r in rs]
+        seen = {c["name"].lower() for c in competitors}
+        for name, score in _mine_candidates(cat_texts, company):
+            if len(competitors) >= max_competitors or out_of_time():
+                break
+            if score < 3 or name.lower() in seen:
+                continue
+            verified, desc, website = verify_competitor(
+                name, company, industry, require_vs=False)
+            print(f"[verify/cat] {name}: {'OK' if verified else 'dropped'}",
+                  flush=True)
+            if verified:
+                seen.add(name.lower())
+                competitors.append({
+                    "name": name, "description": desc, "website": website,
+                    "confidence": min(90, 45 + score * 3),
+                })
     return competitors, [r["url"] for r in serp_results[:12]]
 
 
@@ -550,10 +596,22 @@ _COMPANYISH = re.compile(
     r"design|saas|cloud|service|product|enterprise|workspace|collaborat)", re.I)
 
 
-def verify_competitor(name, company, industry):
+def _same_domain(desc, industry, company):
+    """The candidate's description must actually mention the industry (or the
+    target company). Kills cross-domain junk like a 3D render engine showing
+    up as a food-delivery competitor."""
+    d = desc.lower()
+    if company.lower() in d:
+        return True
+    toks = [t for t in re.split(r"[^a-z]+", industry.lower()) if len(t) > 3]
+    return any(t[:6] in d for t in toks) if toks else True
+
+
+def verify_competitor(name, company, industry, require_vs=True):
     """A candidate only counts if the live web shows real head-to-head
     evidence: a '<name> vs <company>' title or an 'alternative to <company>'
-    context. Kills SERP noise like 'Download' or 'Learn'."""
+    context — AND its description matches the industry. With require_vs=False
+    (category fallback for small companies) the industry match alone decides."""
     nl, cl = name.lower(), company.lower()
     vs_pat = re.compile(
         r"(?:{n}.{{0,30}}\b(?:vs|versus)\b\.?.{{0,30}}{c}|"
@@ -578,7 +636,7 @@ def verify_competitor(name, company, industry):
         if nl in t and (f"alternative to {cl}" in s or f"{cl} alternative" in s):
             verified = True
             break
-    if not verified:
+    if require_vs and not verified:
         return False, "", ""
 
     # get a description + website from an independent query
@@ -612,14 +670,75 @@ def verify_competitor(name, company, industry):
             if not any(d in dom for d in DIRECTORY_DOMAINS):
                 website = "https://" + dom
                 break
-    return bool(desc), desc, website
+    ok = bool(desc) and _same_domain(desc, industry, company)
+    return ok, desc, website
 
 
 # --------------------------------------------------------------------------
-# Lead discovery (decision makers via LinkedIn search results)
+# Lead discovery — PROSPECTIVE CLIENTS, not company insiders.
+# We infer who would BUY this product (buyer personas from the industry and
+# the company's own positioning), then find real people worldwide holding
+# those roles on LinkedIn. Small business owner or enterprise head — anyone
+# whose job matches the product's customer profile.
 # --------------------------------------------------------------------------
 
-LEAD_ROLES = ["CEO", "Founder", "CTO", "Head of Marketing"]
+BUYER_PERSONAS = [
+    (("education", "edtech", "campus", "college", "university", "school",
+      "student", "placement", "admission"),
+     ["Training and Placement Officer", "College Principal",
+      "Director of Admissions", "Dean of Students", "Head of Academics"]),
+    (("food delivery", "restaurant", "food and beverage", "kitchen"),
+     ["Restaurant Owner", "F&B Manager", "Cloud Kitchen Founder",
+      "Restaurant Operations Manager"]),
+    (("productivity", "project management", "collaboration", "workspace",
+      "saas", "crm"),
+     ["Head of Operations", "Chief of Staff", "IT Manager",
+      "Program Manager", "Operations Director"]),
+    (("design", "interface", "creative", "prototyp"),
+     ["Head of Design", "Creative Director", "UX Manager",
+      "Product Design Lead"]),
+    (("fintech", "payment", "banking", "brokerage", "trading", "invest",
+      "insurance"),
+     ["CFO", "Finance Manager", "Head of Treasury", "Wealth Manager"]),
+    (("marketing", "seo", "advertis", "social media", "brand"),
+     ["Head of Marketing", "CMO", "Growth Manager",
+      "Digital Marketing Manager"]),
+    (("logistics", "supply chain", "delivery", "freight", "fleet"),
+     ["Supply Chain Manager", "Head of Logistics", "Fleet Manager",
+      "Warehouse Operations Manager"]),
+    (("health", "medical", "pharma", "biotech", "clinic", "hospital"),
+     ["Hospital Administrator", "Medical Director", "Clinic Owner",
+      "Head of Procurement Healthcare"]),
+    (("retail", "ecommerce", "e-commerce", "commerce", "store"),
+     ["Ecommerce Manager", "Retail Store Owner", "Head of Merchandising",
+      "Category Manager"]),
+    (("cyber", "security", "cloud", "devops", "developer"),
+     ["CISO", "IT Director", "Head of Engineering", "DevOps Lead"]),
+    (("real estate", "property", "construction"),
+     ["Real Estate Broker", "Property Manager", "Head of Leasing"]),
+    (("travel", "hotel", "hospitality", "tourism"),
+     ["Hotel General Manager", "Travel Agency Owner",
+      "Head of Revenue Management"]),
+    (("hr", "recruit", "talent", "hiring", "people"),
+     ["HR Director", "Talent Acquisition Manager", "Head of People"]),
+]
+
+GENERIC_BUYERS = ["Head of Operations", "Procurement Manager",
+                  "Business Owner", "Managing Director"]
+
+
+def buyer_roles(industry, positioning):
+    """Which job titles are likely BUYERS of this company's product?"""
+    blob = (industry + " " + positioning.get("description", "") + " " +
+            positioning.get("tagline", "") + " " +
+            positioning.get("h1", "")).lower()
+    roles = []
+    for keys, persona_roles in BUYER_PERSONAS:
+        if any(k in blob for k in keys):
+            roles.extend(r for r in persona_roles if r not in roles)
+        if len(roles) >= 6:
+            break
+    return roles[:6] if roles else GENERIC_BUYERS
 
 _LI_TITLE_SPLIT = re.compile(r"\s+[-–—|]\s+")
 
@@ -654,40 +773,40 @@ def _parse_linkedin_result(r, company_hint):
     }
 
 
-def _lead_queries(role, target):
-    return [
-        f'site:linkedin.com/in "{role}" "{target}"',
-        f'{target} {role} linkedin.com/in',
-    ]
-
-
-def find_leads(company, industry, competitors, max_leads=12):
-    """Decision makers at the target company and its top competitors."""
-    targets = [company] + [c["name"] for c in competitors[:3]]
-    leads, seen = [], set()
-    sources = []
-    for target in targets:
-        for role in LEAD_ROLES:
-            if len(leads) >= max_leads:
-                return leads, sources
-            found = None
-            for q in _lead_queries(role, target):
-                for r in web_search(q, 6):
-                    lead = _parse_linkedin_result(r, target)
-                    if lead and lead["linkedin_url"] not in seen:
-                        # the lead must actually mention the target company
-                        blob = (r["title"] + " " + r["snippet"]).lower()
-                        if target.lower() not in blob:
-                            continue
-                        found = lead
-                        break
-                if found:
+def find_leads(company, industry, positioning, max_leads=15):
+    """Prospective CLIENTS worldwide: real people whose job title matches
+    the buyer personas for this product — the people an outbound motion
+    would actually pitch."""
+    roles = buyer_roles(industry, positioning)
+    print(f"[leads] buyer personas: {roles}", flush=True)
+    leads, seen, sources = [], set(), []
+    ind_short = " ".join(industry.split()[:2])
+    for role in roles:
+        if len(leads) >= max_leads or out_of_time():
+            break
+        queries = [
+            f'site:linkedin.com/in "{role}" {ind_short}',
+            f'site:linkedin.com/in "{role}"',
+            f'"{role}" {ind_short} linkedin.com/in',
+        ]
+        got_for_role = 0
+        for q in queries:
+            if got_for_role >= 3 or len(leads) >= max_leads:
+                break
+            for r in web_search(q, 8):
+                if got_for_role >= 3 or len(leads) >= max_leads:
                     break
-            if found:
-                seen.add(found["linkedin_url"])
-                found["is_target_company"] = target.lower() == company.lower()
-                leads.append(found)
-                sources.append(found["linkedin_url"])
+                lead = _parse_linkedin_result(r, "")
+                if not lead or lead["linkedin_url"] in seen:
+                    continue
+                # their own employer parsed from the LinkedIn title
+                if not lead["company"]:
+                    lead["company"] = "—"
+                lead["persona"] = role
+                seen.add(lead["linkedin_url"])
+                leads.append(lead)
+                sources.append(lead["linkedin_url"])
+                got_for_role += 1
     return leads, sources
 
 

@@ -60,11 +60,12 @@ def build_report(company, industry, competitors, leads, positioning, trends):
             f"Market signal worth noting: {_clip(trends['stats'][0], 220)}"
         )
     if n_leads:
-        target_leads = [l for l in leads if l.get("is_target_company")]
+        personas = sorted({l.get("persona", l.get("role", "")) for l in leads
+                           if l.get("persona") or l.get("role")})[:3]
         summary_bits.append(
-            f"We surfaced {n_leads} named decision makers across the competitive set"
-            + (f", including {target_leads[0]['name']} ({target_leads[0]['role']}) at {company} itself"
-               if target_leads else "") + "."
+            f"We surfaced {n_leads} prospective buyers worldwide matching "
+            f"{company}'s customer profile"
+            + (f" ({', '.join(personas)})" if personas else "") + "."
         )
     summary = " ".join(summary_bits)
 
@@ -102,15 +103,17 @@ def build_report(company, industry, competitors, leads, positioning, trends):
         })
 
     if leads:
-        roles = sorted({l["role"].split(",")[0] for l in leads if l.get("role")})[:4]
+        personas = sorted({l.get("persona", l.get("role", "")) for l in leads
+                           if l.get("persona") or l.get("role")})[:4]
         growth.append({
-            "title": "Run targeted outbound at the mapped decision makers",
+            "title": "Run targeted outbound at the mapped buyer prospects",
             "detail": (
-                f"This research produced {n_leads} named, LinkedIn-verified contacts "
-                f"({', '.join(roles)}) across {company} and its rivals. Contacts at competitor "
-                f"firms are dual-use: they are partnership and hiring targets, and their public "
-                f"activity telegraphs competitor roadmaps. A 20-touch/week outbound motion against "
-                f"this list is the cheapest pipeline {company} can generate this quarter."
+                f"This research produced {n_leads} named, LinkedIn-verified prospects whose "
+                f"job titles ({', '.join(personas)}) match the people who buy products like "
+                f"{company}'s. These are potential CLIENTS, not industry insiders — each one is "
+                f"an outbound-ready contact. A 20-touch/week motion against this list, with the "
+                f"persona-specific pain point in the first line, is the cheapest pipeline "
+                f"{company} can generate this quarter."
             ),
         })
 
@@ -163,20 +166,18 @@ def build_report(company, industry, competitors, leads, positioning, trends):
             ),
         })
 
-    if len(risks) < 3 and leads:
-        comp_leads = [l for l in leads if not l.get("is_target_company")]
-        if comp_leads:
-            ex = comp_leads[0]
-            risks.append({
-                "title": "Talent and attention drain toward louder competitors",
-                "detail": (
-                    f"Competitor leadership is publicly visible and actively building audience — "
-                    f"e.g. {ex['name']} ({ex['role']}, {ex['company']}) ranks for the exact searches "
-                    f"{company}'s buyers run. In {industry}, the vendor whose executives own the "
-                    f"conversation gets first call. Silence at the top of {company} is a "
-                    f"compounding disadvantage."
-                ),
-            })
+    if len(risks) < 3 and competitors:
+        top = competitors[0]
+        risks.append({
+            "title": f"Losing the buyer's shortlist to {top['name']}",
+            "detail": (
+                f"The prospects this research surfaced are the same people {top['name']} and the "
+                f"rest of the field are pitching. In {industry}, buyers shortlist two or three "
+                f"vendors and never hear about the rest. If {company} is not visible in the "
+                f"channels these personas use (LinkedIn, industry comparisons, peer reviews), it "
+                f"loses deals it never knew existed — silently and repeatedly."
+            ),
+        })
 
     while len(risks) < 3:
         risks.append({
