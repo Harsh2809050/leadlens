@@ -65,6 +65,11 @@ NOISE_NAMES.update({
     "jan", "feb", "mar", "apr", "jun", "jul", "aug", "sep", "sept",
     "oct", "nov", "dec", "ux", "ui", "ai", "t.o.p", "pros", "cons",
     "pro", "con", "faq", "faqs", "web", "online", "site", "page",
+    "world's", "worlds", "edtech", "fintech", "saas", "tech",
+    "united", "states", "india", "america", "europe", "global",
+    "funded", "funding", "startups", "startup", "sequoia", "time",
+    "statista", "ranking", "rankings", "list", "lists", "guide",
+    "companies", "company", "solutions", "services", "platforms",
 })
 
 
@@ -399,6 +404,8 @@ def fetch_page_text(url, limit=6000):
 # --------------------------------------------------------------------------
 
 KNOWN_INDUSTRIES = [
+    "test prep", "tutoring", "online tutoring", "exam preparation",
+    "language learning", "e-learning", "online learning",
     "productivity software", "project management software", "developer tools",
     "cybersecurity", "cloud computing", "artificial intelligence",
     "data analytics", "marketing software", "hr software", "crm software",
@@ -420,8 +427,17 @@ _IS_A_PAT = re.compile(
     r" headquartered| based| owned| primarily| used )", re.I)
 
 
-def detect_industry(company):
-    """Work out what industry a company is in from live search results."""
+def detect_industry(company, positioning=None):
+    """Work out what industry a company is in. The company's OWN website copy
+    is the strongest signal — check it before anything from search results."""
+    if positioning:
+        own = " ".join(str(positioning.get(k, "")) for k in
+                       ("tagline", "description", "h1")).lower()
+        own_scores = {k: own.count(k) for k in KNOWN_INDUSTRIES}
+        own_best = max(own_scores, key=lambda k: (own_scores[k], len(k)))
+        if own_scores[own_best] > 0:
+            return own_best
+
     rs = web_search(f"{company} wikipedia company", 6)
     rs += web_search(f"{company} company profile industry", 6)
     text = " ".join((r["title"] + " " + r["snippet"]) for r in rs).lower()
@@ -471,6 +487,9 @@ def detect_industry(company):
 # --------------------------------------------------------------------------
 
 _CAP_NAME = re.compile(r"\b([A-Z][A-Za-z0-9&.']+(?:[ \-][A-Z][A-Za-z0-9&.']+){0,2})\b")
+_LIST_CUE = re.compile(
+    r"(?:like|such as|including|includes?|alternatives?(?:\s+(?:to\s+\S+|are|:))?|"
+    r"competitors?(?:\s+(?:of\s+\S+|are|include|:))?)\s+([A-Z][^.;!?]{5,120})")
 _VS = re.compile(r"(?:\bvs\.?\s+|\bversus\s+)([A-Z][A-Za-z0-9&.'\-]+(?:\s[A-Z][A-Za-z0-9&.'\-]+)?)")
 _NUMBERED = re.compile(r"^\s*\d+[.)]\s*([A-Z][A-Za-z0-9&.' \-]{1,40})$")
 
@@ -483,9 +502,10 @@ def _clean_candidate(name, company):
     if low == company.lower() or company.lower() in low or low in company.lower():
         return None
     words = low.split()
-    if all(w in NOISE_NAMES for w in words):
+    if len(words) > 4:
         return None
-    if words[0] in NOISE_NAMES and len(words) > 1:
+    # ANY junk token disqualifies: kills "World's Top EdTech", "United States"
+    if any(w.strip(".'’s") in NOISE_NAMES for w in words):
         return None
     if any(ch.isdigit() for ch in name) and not re.match(r"^[A-Za-z]+\d+$", name):
         return None
@@ -526,19 +546,26 @@ def find_competitors(company, industry, max_competitors=8, progress=None):
         f"{company} vs",
     ]
     serp_results = []
-    texts = []
+    texts = []  # STRUCTURED evidence only — no loose words from headlines
     for q in queries:
         rs = web_search(q, 10)
         serp_results.extend(rs)
         for r in rs:
-            texts.append((1, r["title"]))
-            texts.append((1, r["snippet"]))
+            blob = r["title"] + ". " + r["snippet"]
+            for m in _VS.finditer(blob):              # "X vs Figma"
+                texts.append((3, m.group(1)))
+            for m in _LIST_CUE.finditer(blob):        # "like A, B and C"
+                for part in re.split(r",|\band\b|&", m.group(1)):
+                    part = part.strip()
+                    if part:
+                        texts.append((2, part))
 
-    # Pull headings from the two most promising comparison articles
+    # Pull headings from the most promising comparison articles — the
+    # highest-quality source: list items on "alternatives" pages ARE names
     fetched = 0
     for r in serp_results:
         dom = urlparse(r["url"]).netloc.lower()
-        if fetched >= 2:
+        if fetched >= 3 or out_of_time():
             break
         if any(d in dom for d in ("linkedin.com", "youtube.com", "reddit.com")):
             continue
@@ -577,9 +604,25 @@ def find_competitors(company, industry, max_competitors=8, progress=None):
     if len(competitors) < 3 and not out_of_time():
         print(f"[competitors] falling back to category search for {industry}",
               flush=True)
-        rs = web_search(f"top {industry} companies", 10)
-        rs += web_search(f"best {industry} platforms", 8)
-        cat_texts = [(2, r["title"]) for r in rs] + [(1, r["snippet"]) for r in rs]
+        rs = web_search(f"top {industry} companies", 8)
+        rs += web_search(f"best {industry} platforms", 6)
+        # mine the list-article PAGES (headings = names), not their headlines
+        cat_texts = []
+        cat_fetched = 0
+        for r in rs:
+            if cat_fetched >= 3 or out_of_time():
+                break
+            dom = urlparse(r["url"]).netloc.lower()
+            if any(d in dom for d in ("linkedin.com", "youtube.com", "reddit.com")):
+                continue
+            _, soup = fetch_page_text(r["url"])
+            if soup is None:
+                continue
+            for h in soup.select("h2, h3"):
+                line = h.get_text(" ", strip=True)
+                m = _NUMBERED.match(line)
+                cat_texts.append((3, m.group(1) if m else line))
+            cat_fetched += 1
         seen = {c["name"].lower() for c in competitors}
         for name, score in _mine_candidates(cat_texts, company):
             if len(competitors) >= max_competitors or out_of_time():
@@ -753,12 +796,20 @@ _LI_TITLE_SPLIT = re.compile(r"\s+[-–—|]\s+")
 
 _LI_URL = re.compile(r"https?://[a-z]{0,3}\.?linkedin\.com/in/[A-Za-z0-9\-_%.]+")
 
+_BAD_LEAD_NAMES = {"sign in", "log in", "login", "linkedin", "join linkedin",
+                   "sign up", "join now"}
+_ROLE_WORDS_IN_NAME = re.compile(
+    r"\b(officer|principal|director|admissions?|training|placement|manager|"
+    r"head|dean|professor|recruiter)\b", re.I)
+
 
 def _parse_linkedin_result(r, company_hint):
     m = _LI_URL.search(r["url"]) or _LI_URL.search(unquote(r["url"]))
     if not m:
         return None
     url = m.group(0)
+    # normalize country subdomains so in./au./www. duplicates collapse
+    url = re.sub(r"https?://[a-z]{0,3}\.?linkedin\.com", "https://www.linkedin.com", url)
     parts = _LI_TITLE_SPLIT.split(r["title"].replace(" | LinkedIn", "").replace(" - LinkedIn", ""))
     parts = [p.strip() for p in parts if p.strip() and p.strip().lower() != "linkedin"]
     if not parts:
@@ -766,6 +817,8 @@ def _parse_linkedin_result(r, company_hint):
     name = parts[0]
     if len(name) > 45 or len(name.split()) > 4 or not re.match(r"^[A-Z]", name):
         return None
+    if name.lower() in _BAD_LEAD_NAMES or _ROLE_WORDS_IN_NAME.search(name):
+        return None  # page chrome or a job title masquerading as a person
     role = parts[1] if len(parts) > 1 else ""
     company = company_hint
     # titles are often "Name - Role at Company"
@@ -781,14 +834,15 @@ def _parse_linkedin_result(r, company_hint):
     }
 
 
-def find_leads(company, industry, positioning, max_leads=15):
+def find_leads(company, industry, positioning, max_leads=50):
     """Prospective CLIENTS worldwide: real people whose job title matches
     the buyer personas for this product — the people an outbound motion
-    would actually pitch."""
+    would actually pitch. Targets 50 contacts across personas."""
     roles = buyer_roles(industry, positioning)
     print(f"[leads] buyer personas: {roles}", flush=True)
     leads, seen, sources = [], set(), []
     ind_short = " ".join(industry.split()[:2])
+    per_role = max(6, max_leads // max(len(roles), 1) + 2)
     for role in roles:
         if len(leads) >= max_leads or out_of_time():
             break
@@ -796,13 +850,14 @@ def find_leads(company, industry, positioning, max_leads=15):
             f'site:linkedin.com/in "{role}" {ind_short}',
             f'site:linkedin.com/in "{role}"',
             f'"{role}" {ind_short} linkedin.com/in',
+            f'"{role}" linkedin profile',
         ]
         got_for_role = 0
         for q in queries:
-            if got_for_role >= 3 or len(leads) >= max_leads:
+            if got_for_role >= per_role or len(leads) >= max_leads:
                 break
-            for r in web_search(q, 8):
-                if got_for_role >= 3 or len(leads) >= max_leads:
+            for r in web_search(q, 10):
+                if got_for_role >= per_role or len(leads) >= max_leads:
                     break
                 lead = _parse_linkedin_result(r, "")
                 if not lead or lead["linkedin_url"] in seen:

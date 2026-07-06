@@ -21,6 +21,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
 import db
+import llm
 import report as report_mod
 import research
 
@@ -45,7 +46,7 @@ def _lock_for(key):
 def run_research(company: str, industry: str) -> dict:
     """Full live research pipeline. Returns the complete payload."""
     sources = []
-    research.set_deadline(150)  # hard budget: return what we have, never spin
+    research.set_deadline(180)  # hard budget: return what we have, never spin
 
     positioning = research.get_positioning(company, industry)
     if positioning.get("website"):
@@ -60,8 +61,34 @@ def run_research(company: str, industry: str) -> dict:
     trends = research.get_trends(company, industry)
     sources.extend(trends.get("sources", []))
 
-    rep = report_mod.build_report(company, industry, competitors, leads,
-                                  positioning, trends)
+    # LLM upgrade (free GROQ_API_KEY): real competitor extraction + a
+    # company-specific report. Falls back to rule-based on any failure.
+    if llm.available():
+        try:
+            serp_blob = " | ".join(
+                r["title"] + " — " + r["snippet"]
+                for r in research._serp_cache.get(f"{company} competitors", [])
+            ) + " | ".join(f'{c["name"]}: {c["description"]}' for c in competitors)
+            refined = llm.refine_competitors(company, industry, serp_blob,
+                                             competitors)
+            if len(refined) >= 3:
+                competitors = refined
+                print(f"[llm] competitors refined: "
+                      f"{[c['name'] for c in competitors]}", flush=True)
+        except Exception as e:
+            print(f"[llm] competitor refine failed: {e}", flush=True)
+
+    rep = None
+    if llm.available():
+        try:
+            rep = llm.write_report(company, industry, competitors, leads,
+                                   positioning, trends)
+            print("[llm] report written by LLM", flush=True)
+        except Exception as e:
+            print(f"[llm] report failed, falling back: {e}", flush=True)
+    if rep is None:
+        rep = report_mod.build_report(company, industry, competitors, leads,
+                                      positioning, trends)
 
     return {
         "company": company,
@@ -85,13 +112,15 @@ def get_or_research(company: str, industry: str, refresh: bool = False) -> dict:
         raise HTTPException(status_code=422, detail="company is required")
 
     # No industry given: reuse any cached research for this company,
-    # otherwise auto-detect the industry from live search results.
+    # otherwise auto-detect it — the company's own website is read first
+    # because it is the strongest signal of what they actually sell.
     if not industry:
         if not refresh:
             cached = db.find_by_company(company)
             if cached:
                 return cached
-        industry = research.detect_industry(company)
+        pos = research.get_positioning(company, "")
+        industry = research.detect_industry(company, pos)
 
     key = db.make_key(company, industry)
     if not refresh:
