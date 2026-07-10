@@ -133,3 +133,20 @@ html {
 .status-dot {
   animation: ping-soft 2s ease-out infinite;
 }
+
+/* results entrance */
+@keyframes rise {
+  from { opacity: 0; transform: translateY(12px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+.rise {
+  animation: rise 0.45s ease both;
+}
+.rise > * {
+  animation: rise 0.5s ease both;
+}
+.rise > *:nth-child(2) { animation-delay: 0.05s; }
+.rise > *:nth-child(3) { animation-delay: 0.1s; }
+.rise > *:nth-child(4) { animation-delay: 0.15s; }
+.rise > *:nth-child(5) { animation-delay: 0.2s; }
+.rise > *:nth-child(6) { animation-delay: 0.25s; }

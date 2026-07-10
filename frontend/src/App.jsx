@@ -139,7 +139,7 @@ export default function App() {
         {data && (
           <>
             <TabNav />
-            <div className="space-y-14">
+            <div className="rise space-y-14">
               {/* meta bar */}
               <div className="tcard flex flex-wrap items-center gap-3 rounded-xl border border-slate-800 bg-slate-900/60 px-5 py-3.5 text-sm">
                 <span className="font-mono text-xs text-indigo-400">⌖</span>
