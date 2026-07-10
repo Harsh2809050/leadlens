@@ -1,6 +1,15 @@
 @echo off
 setlocal
 REM ---------- LeadLens launcher (Windows) ----------
+
+REM Free key from console.groq.com — activates LLM-assisted competitor
+REM refinement and report writing. Kept OUT of this file on purpose: this
+REM repo isn't under git yet, but the README's own deploy instructions say
+REM to "git init && git add . && git commit && push" — start.bat would be
+REM swept into that commit, so a real secret must never live here. It lives
+REM in local_secrets.bat instead, which .gitignore excludes.
+if exist "%~dp0local_secrets.bat" call "%~dp0local_secrets.bat"
+
 cd /d "%~dp0backend"
 
 REM Find a working Python (py launcher first, then python)
