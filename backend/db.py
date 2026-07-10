@@ -35,15 +35,60 @@ def _conn():
         )
         """
     )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS serp_cache (
+            query       TEXT PRIMARY KEY,
+            results     TEXT NOT NULL,
+            ts          REAL NOT NULL
+        )
+        """
+    )
     return conn
 
 
-def make_key(company: str, industry: str) -> str:
-    return (company or "").strip().lower() + "::" + (industry or "").strip().lower()
+SERP_CACHE_MAX_AGE = 14 * 24 * 3600  # 14 days
 
 
-def get_cached(company: str, industry: str):
-    key = make_key(company, industry)
+def get_serp(query: str):
+    """A raw search-engine query result, persisted to disk (not just this
+    process's memory) so that once ANY run has successfully searched
+    something, every future run — even after a restart, even during a
+    rate-limited window — gets it instantly with zero network calls. This
+    is the main lever against rate-limiting at real traffic: the fraction of
+    queries that need a live engine at all shrinks over time as the cache
+    warms up."""
+    conn = _conn()
+    try:
+        row = conn.execute(
+            "SELECT results, ts FROM serp_cache WHERE query = ?", (query,)
+        ).fetchone()
+        if row and (time.time() - row[1]) < SERP_CACHE_MAX_AGE:
+            return json.loads(row[0])
+        return None
+    finally:
+        conn.close()
+
+
+def save_serp(query: str, results: list):
+    conn = _conn()
+    try:
+        conn.execute(
+            "INSERT OR REPLACE INTO serp_cache (query, results, ts) VALUES (?, ?, ?)",
+            (query, json.dumps(results), time.time()),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def make_key(company: str, industry: str, location: str = "") -> str:
+    return ((company or "").strip().lower() + "::" + (industry or "").strip().lower()
+            + "::" + (location or "").strip().lower())
+
+
+def get_cached(company: str, industry: str, location: str = ""):
+    key = make_key(company, industry, location)
     conn = _conn()
     try:
         row = conn.execute(
@@ -64,15 +109,19 @@ def get_cached(company: str, industry: str):
         conn.close()
 
 
-def save(company: str, industry: str, data: dict):
-    key = make_key(company, industry)
+def save(company: str, industry: str, data: dict, location: str = ""):
+    key = make_key(company, industry, location)
     payload = dict(data)
     payload.pop("cached", None)
     conn = _conn()
     try:
-        # one company keeps only its latest research
-        conn.execute("DELETE FROM searches WHERE company = ? COLLATE NOCASE",
-                     (company.strip(),))
+        # one row per (company, location) — a Mumbai run must never wipe out
+        # the Bangalore run for the same company
+        conn.execute(
+            "DELETE FROM searches WHERE company = ? COLLATE NOCASE "
+            "AND key LIKE ?",
+            (company.strip(), f"%::{(location or '').strip().lower()}"),
+        )
         conn.execute(
             "INSERT OR REPLACE INTO searches (key, company, industry, data, created_at) "
             "VALUES (?, ?, ?, ?, ?)",
@@ -83,14 +132,16 @@ def save(company: str, industry: str, data: dict):
         conn.close()
 
 
-def find_by_company(company: str):
-    """Latest cached result for a company under ANY industry."""
+def find_by_company(company: str, location: str = ""):
+    """Latest cached result for a company under ANY industry — but only for
+    the SAME location. A search for 'tutelaprep in Mumbai' must never be
+    silently answered with the cached Bangalore run (found live: it was)."""
     conn = _conn()
     try:
         row = conn.execute(
             "SELECT data, created_at FROM searches WHERE company = ? COLLATE NOCASE "
-            "ORDER BY created_at DESC LIMIT 1",
-            ((company or "").strip(),),
+            "AND key LIKE ? ORDER BY created_at DESC LIMIT 1",
+            ((company or "").strip(), f"%::{(location or '').strip().lower()}"),
         ).fetchone()
         if row:
             data = json.loads(row[0])
@@ -106,10 +157,13 @@ def list_searches():
     conn = _conn()
     try:
         rows = conn.execute(
-            "SELECT company, industry, created_at FROM searches ORDER BY created_at DESC"
+            "SELECT company, industry, key, created_at FROM searches "
+            "ORDER BY created_at DESC"
         ).fetchall()
         return [
-            {"company": r[0], "industry": r[1], "researched_at": r[2]} for r in rows
+            {"company": r[0], "industry": r[1],
+             "location": (r[2].split("::") + ["", "", ""])[2],
+             "researched_at": r[3]} for r in rows
         ]
     finally:
         conn.close()

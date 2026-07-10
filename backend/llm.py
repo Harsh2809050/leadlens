@@ -36,19 +36,49 @@ def _chat(system, user, max_tokens=2500):
     return json.loads(r.json()["choices"][0]["message"]["content"])
 
 
+def detect_industry(company, positioning, serp_blob):
+    """Best-effort industry classification when rule-based keyword counting
+    found nothing. Must say confident=false rather than guess a generic
+    category for companies it doesn't recognize — a confident-but-wrong
+    guess here is what causes downstream competitor search to go off the
+    rails (see research.find_competitors' category fallback)."""
+    system = (
+        "You are a precise research assistant. Determine the industry/"
+        "category of the target company using ONLY the evidence provided. "
+        "If the evidence does not clearly identify a real, recognizable "
+        "company, set confident to false rather than guessing a generic "
+        "category — do not default to something vague like 'technology'. "
+        "Return JSON: {\"industry\": str (2-4 lowercase words, e.g. "
+        "'project management software'), \"confident\": bool}."
+    )
+    user = json.dumps({
+        "company": company,
+        "positioning": positioning,
+        "search_evidence": serp_blob[:4000],
+    })
+    out = _chat(system, user, max_tokens=200)
+    industry = str(out.get("industry", "")).strip().lower()
+    confident = bool(out.get("confident", False)) and bool(industry)
+    return industry, confident
+
+
 def refine_competitors(company, industry, serp_blob, current):
     """Feed the raw search evidence to the LLM and get back real,
     same-domain competitor companies — never listicle fragments."""
     system = (
         "You are a precise market analyst. From the raw web search evidence, "
         "identify REAL companies that directly compete with the target. "
-        "NEVER return publications (TIME, Forbes), directories, categories "
+        "ONLY name a company that is explicitly mentioned by name in the "
+        "search evidence below — never invent or recall a competitor from "
+        "general knowledge, even if it feels like an obvious market leader "
+        "(e.g. do not add Apple/Google/Microsoft unless the evidence itself "
+        "names them). If fewer than 3 companies are actually mentioned in "
+        "the evidence, return fewer entries — never pad the list. NEVER "
+        "return publications (TIME, Forbes), directories, categories "
         "('EdTech'), countries, investors (Sequoia), or article fragments. "
-        "Only actual product/service companies a buyer would compare against "
-        "the target. Return JSON: {\"competitors\": [{\"name\": str, "
+        "Return JSON: {\"competitors\": [{\"name\": str, "
         "\"description\": one factual sentence, \"website\": str}]} "
-        "with 5-10 entries, best matches first. Use evidence + your own "
-        "knowledge of the market."
+        "with up to 10 entries, best matches first."
     )
     user = json.dumps({
         "target_company": company,

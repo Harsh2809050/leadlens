@@ -9,11 +9,15 @@ import os
 import re
 import time
 import random
+import unicodedata
 from collections import Counter
 from urllib.parse import quote_plus, unquote, urlparse
 
 import httpx
 from bs4 import BeautifulSoup
+
+import db
+import llm
 
 HEADERS = {
     "User-Agent": (
@@ -70,6 +74,16 @@ NOISE_NAMES.update({
     "funded", "funding", "startups", "startup", "sequoia", "time",
     "statista", "ranking", "rankings", "list", "lists", "guide",
     "companies", "company", "solutions", "services", "platforms",
+    # Generic prose/heading fragments that survive as isolated capitalized
+    # words on listicle/blog pages but are never themselves a company name
+    # (surfaced by a real run against a test-prep company):
+    "trust", "trusted", "where", "course", "courses", "resources",
+    "resource", "tips", "tests", "test", "practice", "need", "needs",
+    "every", "schools", "school", "counseling", "admissions", "admission",
+    # Standardized exam/qualification names — topically relevant to a
+    # test-prep search but they are exams, not competing companies.
+    "sat", "act", "psat", "gre", "gmat", "mcat", "lsat", "ielts", "toefl",
+    "cat", "jee", "neet", "ged", "gcse", "ap",
 })
 
 
@@ -309,15 +323,40 @@ if BRAVE_API_KEY:
 
 
 _preferred_engine = [None]  # promotes the engine that last worked
-_serp_cache = {}            # query -> results, avoids repeat hits in one run
-_engine_fails = {}          # engine -> consecutive errors; 3+ = skip (circuit breaker)
-_deadline = [None]          # global time budget for one research run
+_serp_cache = {}            # query -> results, in-process — avoids repeat hits
+_engine_fails = {}          # engine -> consecutive EXCEPTIONS; 3+ = skip (process lifetime)
+_engine_empty_streak = {}   # engine -> consecutive EMPTY (but not erroring) results
+_engine_cooldown_until = {} # engine -> unix ts until which to skip it entirely
+_deadline = [None]          # time budget for the CURRENT section (see main.py)
+_consecutive_empty = [0]    # queries in a row (current section) where EVERY
+                            # engine returned zero results — controls the
+                            # backoff-skip optimization below, resets fresh
+                            # each section (see set_deadline)
+_rate_limited_this_run = [False]  # sticky for the WHOLE run — surfaced to the
+                            # UI as "degraded" so an empty section reads as
+                            # "we got rate-limited," not "this company is fake"
+
+EMPTY_STREAK_COOLDOWN = 300  # 5 minutes benched once an engine goes quiet
 
 
 def set_deadline(seconds):
-    """Cap a research run: past the deadline all searches return empty and
-    the pipeline finishes with whatever it has instead of spinning forever."""
+    """Cap the CURRENT SECTION: past the deadline all searches return empty
+    and that section finishes with whatever it has instead of spinning
+    forever. Called once per pipeline section (see main.py's
+    _section_deadline) so one slow section can't starve the ones after it."""
     _deadline[0] = time.time() + seconds
+    _consecutive_empty[0] = 0  # fresh judgment for this section
+
+
+def reset_run_stats():
+    """Call once at the very start of a full research run (not per-section):
+    resets the sticky rate-limited flag surfaced to the UI as 'degraded'."""
+    _consecutive_empty[0] = 0
+    _rate_limited_this_run[0] = False
+
+
+def was_rate_limited():
+    return _rate_limited_this_run[0]
 
 
 def out_of_time():
@@ -326,19 +365,50 @@ def out_of_time():
 
 def web_search(query, max_results=10):
     """Search the live web, falling through engines until one returns results.
-    Slow cadence + one retry pass: search engines rate-limit fast crawlers."""
+    Three layers of resilience against rate-limiting:
+      1. A persistent, disk-backed cache (db.serp_cache) — once ANY run has
+         successfully searched something, every future run gets it instantly
+         with zero network calls, even after a restart. This is the main
+         lever: the fraction of queries needing a live engine shrinks over
+         time as real usage warms the cache.
+      2. Per-engine cooldown — an engine that goes quiet (zero results, no
+         exception — what a soft rate-limit looks like) 4 times in a row
+         gets benched for 5 minutes instead of retried every single query.
+      3. Same-section backoff-skip — if the last 5 queries in THIS section
+         all came back empty from every engine, stop paying the 5s
+         backoff-and-retry; it isn't going to start working mid-section.
+    """
     if query in _serp_cache:
         return _serp_cache[query][:max_results]
     if out_of_time():
         return []
-    for attempt in (1, 2):
+    persisted = db.get_serp(query)
+    if persisted is not None:
+        _serp_cache[query] = persisted
+        return persisted[:max_results]
+
+    broadly_blocked = _consecutive_empty[0] >= 5
+    max_attempts = 1 if broadly_blocked else 2
+    now = time.time()
+    for attempt in range(1, max_attempts + 1):
         time.sleep(random.uniform(0.7, 1.2))  # polite pace beats rate limits
         order = list(ENGINES)
         if _preferred_engine[0]:
             order.sort(key=lambda e: e[0] != _preferred_engine[0])
-        for name, fn in order:
-            if _engine_fails.get(name, 0) >= 3:
-                continue  # circuit breaker: engine is dead this run
+        not_hard_failed = [(n, fn) for n, fn in order if _engine_fails.get(n, 0) < 3]
+        eligible = [(n, fn) for n, fn in not_hard_failed
+                   if _engine_cooldown_until.get(n, 0) <= now]
+        if not eligible and not_hard_failed:
+            # Every non-broken engine is in a soft cooldown at once — seen
+            # live: empty-streak cooldowns benched all 7 mid-run, guaranteeing
+            # every later section (venues/individuals/trends) would fail
+            # regardless of query quality, since nothing was left to even
+            # attempt. Trying the one closest to ready beats a guaranteed
+            # empty. Engines with real repeated EXCEPTIONS stay excluded —
+            # only the soft (empty-result) cooldown gets overridden here.
+            eligible = sorted(not_hard_failed,
+                              key=lambda e: _engine_cooldown_until.get(e[0], 0))
+        for name, fn in eligible:
             try:
                 res = fn(query, max_results)
             except Exception as e:
@@ -346,19 +416,34 @@ def web_search(query, max_results=10):
                 if _engine_fails[name] == 3:
                     print(f"[search] {name} disabled after 3 errors", flush=True)
                 continue
-            _engine_fails[name] = 0
             if res:
+                _engine_fails[name] = 0
+                _engine_empty_streak[name] = 0
                 _preferred_engine[0] = name
                 _serp_cache[query] = res
+                db.save_serp(query, res)
+                _consecutive_empty[0] = 0
                 print(f"[search] {len(res):>2} results via {name}: {query!r}",
                       flush=True)
                 return res
-        if attempt == 1:
+            _engine_empty_streak[name] = _engine_empty_streak.get(name, 0) + 1
+            if _engine_empty_streak[name] >= 4:
+                _engine_cooldown_until[name] = now + EMPTY_STREAK_COOLDOWN
+                print(f"[search] {name} benched for {EMPTY_STREAK_COOLDOWN}s "
+                      f"after {_engine_empty_streak[name]} empty results in a row",
+                      flush=True)
+        if attempt < max_attempts:
             if out_of_time():
                 break
             print(f"[search] all engines empty for {query!r}; backing off 5s",
                   flush=True)
             time.sleep(5)
+    _consecutive_empty[0] += 1
+    if _consecutive_empty[0] == 5:
+        _rate_limited_this_run[0] = True
+        print("[search] 5 queries in a row came back empty from every engine "
+              "— likely rate-limited right now; skipping retry/backoff for "
+              "the rest of this section", flush=True)
     _serp_cache[query] = []
     return []
 
@@ -403,20 +488,80 @@ def fetch_page_text(url, limit=6000):
 # Industry auto-detection (user only types a company name)
 # --------------------------------------------------------------------------
 
-KNOWN_INDUSTRIES = [
-    "test prep", "tutoring", "online tutoring", "exam preparation",
-    "language learning", "e-learning", "online learning",
-    "productivity software", "project management software", "developer tools",
-    "cybersecurity", "cloud computing", "artificial intelligence",
-    "data analytics", "marketing software", "hr software", "crm software",
-    "e-commerce", "fintech", "payments", "banking", "insurance technology",
-    "healthcare technology", "biotechnology", "pharmaceuticals", "edtech",
-    "food delivery", "ride hailing", "travel technology", "hospitality",
-    "streaming media", "social media", "gaming", "consumer electronics",
-    "semiconductors", "electric vehicles", "automotive", "aerospace",
-    "logistics", "supply chain", "real estate technology", "retail",
-    "fashion", "food and beverage", "energy", "telecommunications", "saas",
+# Each canonical label maps to a bucket of loose synonyms — matching the
+# same "keyword bucket -> label" pattern already used successfully by
+# BUYER_PERSONAS/AUDIENCE_GATEKEEPERS below. A flat list of exact phrases
+# ("test prep") missed real companies that phrase it differently ("coaching
+# for competitive exams", "SAT prep courses") and fell through to the
+# generic "technology" placeholder — which then poisoned every downstream
+# query (competitors, lead qualifiers, venue categories) with a wrong label.
+INDUSTRY_TAXONOMY = [
+    ("test prep", ("test prep", "exam prep", "entrance exam", "competitive exam",
+                   "sat prep", "act prep", "coaching classes", "coaching institute",
+                   "coaching for")),
+    ("tutoring", ("tutoring", "tutor", "home tuition", "private lessons")),
+    ("edtech", ("edtech", "e-learning", "elearning", "online learning",
+                "online courses", "online education", "learning platform",
+                "learning app")),
+    ("language learning", ("language learning", "learn a language", "language app")),
+    ("productivity software", ("productivity app", "productivity tool", "task management",
+                              "note-taking", "notes app", "workspace app")),
+    ("project management software", ("project management", "kanban", "sprint planning")),
+    ("developer tools", ("developer tools", "api platform", "sdk", "devops platform")),
+    ("cybersecurity", ("cybersecurity", "cyber security", "infosec", "threat detection")),
+    ("cloud computing", ("cloud computing", "cloud infrastructure", "cloud platform")),
+    ("artificial intelligence", ("artificial intelligence", "machine learning",
+                                "generative ai", "ai model", "ai platform")),
+    ("data analytics", ("data analytics", "business intelligence", "data platform")),
+    ("marketing software", ("marketing software", "marketing automation", "seo tool")),
+    ("hr software", ("hr software", "human resources platform", "payroll software")),
+    ("crm software", ("crm platform", "customer relationship management")),
+    ("e-commerce", ("e-commerce", "ecommerce", "online store", "online shopping",
+                    "online marketplace")),
+    ("fintech", ("fintech", "digital payments", "neobank", "financial technology",
+                "payment gateway")),
+    ("banking", ("banking", "bank account", "digital bank")),
+    ("insurance technology", ("insurtech", "insurance technology", "digital insurance")),
+    ("healthcare technology", ("healthtech", "healthcare technology", "digital health",
+                              "telemedicine")),
+    ("biotechnology", ("biotech", "biotechnology", "life sciences")),
+    ("pharmaceuticals", ("pharmaceutical", "pharma company", "drug development")),
+    ("food delivery", ("food delivery", "food ordering app")),
+    ("ride hailing", ("ride hailing", "ride-sharing", "ride sharing", "cab booking")),
+    ("travel technology", ("travel booking", "travel technology", "trip planning app")),
+    ("hospitality", ("hospitality", "hotel booking", "hotel management")),
+    ("streaming media", ("streaming service", "video on demand", "ott platform")),
+    ("social media", ("social media", "social network", "social app")),
+    ("gaming", ("gaming studio", "video game", "game studio", "mobile game")),
+    ("consumer electronics", ("consumer electronics", "smart devices")),
+    ("electric vehicles", ("electric vehicle", "ev maker", "ev startup")),
+    ("automotive", ("automotive", "car manufacturer", "vehicle manufacturer")),
+    ("logistics", ("logistics", "supply chain", "freight", "fleet management")),
+    ("real estate technology", ("proptech", "real estate platform", "property listing")),
+    ("retail", ("retail chain", "retail store", "retailer")),
+    ("fashion", ("fashion brand", "apparel brand", "clothing brand")),
+    ("food and beverage", ("food and beverage", "restaurant chain", "beverage brand")),
+    ("energy", ("energy company", "renewable energy", "solar energy")),
+    ("telecommunications", ("telecom operator", "telecommunications", "mobile network operator")),
+    ("saas", ("saas platform", "software as a service", "b2b software")),
 ]
+
+
+def _keyword_score(blob, synonyms):
+    score = 0
+    for syn in synonyms:
+        if " " in syn or len(syn) > 5:
+            score += blob.count(syn)
+        else:
+            score += len(re.findall(r"\b" + re.escape(syn) + r"\b", blob))
+    return score
+
+
+def _best_industry_match(blob):
+    """Highest-scoring taxonomy label for a blob of text, or (None, 0)."""
+    scored = [(label, _keyword_score(blob, syns)) for label, syns in INDUSTRY_TAXONOMY]
+    best_label, best_score = max(scored, key=lambda x: x[1])
+    return (best_label, best_score) if best_score > 0 else (None, 0)
 
 _IND_PAT = re.compile(
     r"industr(?:y|ies)\s*[:\-–]\s*([A-Za-z &/]{3,40})", re.I)
@@ -428,24 +573,46 @@ _IS_A_PAT = re.compile(
 
 
 def detect_industry(company, positioning=None):
-    """Work out what industry a company is in. The company's OWN website copy
-    is the strongest signal — check it before anything from search results."""
-    if positioning:
-        own = " ".join(str(positioning.get(k, "")) for k in
-                       ("tagline", "description", "h1")).lower()
-        own_scores = {k: own.count(k) for k in KNOWN_INDUSTRIES}
-        own_best = max(own_scores, key=lambda k: (own_scores[k], len(k)))
-        if own_scores[own_best] > 0:
-            return own_best
+    """Work out what industry a company is in. Returns (industry, confident).
+    The company's OWN website copy is the strongest signal — check it before
+    anything from search results. `confident=False` means no real signal was
+    found anywhere (rule-based or LLM) — callers must NOT treat the returned
+    label as a real category to search against (see find_competitors), only
+    as a harmless display placeholder."""
+    positioning = positioning or {}
+    own = " ".join(str(positioning.get(k, "")) for k in
+                   ("tagline", "description", "h1")).lower()
+    own_best, own_score = _best_industry_match(own)
+    if own_best:
+        return own_best, True
+
+    # The company's own copy often phrases it in free text instead of one of
+    # our known-category keywords ("We help teams plan sprints faster") —
+    # try the same anchored "X is a ..." extraction against it before
+    # spending any network calls, since it's already fetched and it's the
+    # single best signal of what the company actually does.
+    own_anchored = re.compile(
+        r"\bis an? ([a-z][a-z ,/&\-]{4,70}?)"
+        r"(?:\.|,| that| which| developed| founded| headquartered| based|"
+        r" owned| primarily| used |$)", re.I)
+    m = own_anchored.search(own)
+    if m:
+        phrase = re.sub(r"\s+", " ", m.group(1)).strip(" -,.")
+        if 4 <= len(phrase) <= 60:
+            tail = phrase.split(" for ")[-1].strip()
+            cand = tail if 4 <= len(tail) <= 40 else phrase
+            if len(cand) > 40:
+                cand = cand[:40].rsplit(" ", 1)[0]
+            if len(cand) >= 4:
+                return cand, True
 
     rs = web_search(f"{company} wikipedia company", 6)
     rs += web_search(f"{company} company profile industry", 6)
     text = " ".join((r["title"] + " " + r["snippet"]) for r in rs).lower()
 
-    scores = {k: text.count(k) for k in KNOWN_INDUSTRIES}
-    best = max(scores, key=lambda k: (scores[k], len(k)))
-    if scores[best] > 1:
-        return best
+    best, best_score = _best_industry_match(text)
+    if best_score > 1:
+        return best, True
 
     # "Figma is a collaborative web application for interface design..."
     # anchored to the company name so a stray "Wikipedia is a free online
@@ -472,19 +639,49 @@ def detect_industry(company, positioning=None):
                 if len(cand) > 40:  # cut at a word boundary, never mid-word
                     cand = cand[:40].rsplit(" ", 1)[0]
                 if len(cand) >= 4:
-                    return cand
+                    return cand, True
 
-    if scores[best] > 0:
-        return best
+    if best_score > 0:
+        return best, True
     m = _IND_PAT.search(" ".join(r["snippet"] for r in rs))
     if m:
-        return m.group(1).strip().lower()
-    return "technology"
+        return m.group(1).strip().lower(), True
+
+    # No rule-based signal at all. Try the LLM as a last resort — it can
+    # recognize real but obscure companies keyword-counting can't, and will
+    # honestly report "not confident" for made-up ones instead of us
+    # silently defaulting to a generic bucket like "technology" (which is
+    # exactly what caused fake FAANG "competitors" to show up for unknown
+    # companies — see find_competitors' category fallback).
+    if llm.available():
+        try:
+            guess, confident = llm.detect_industry(company, positioning, text)
+            if guess:
+                return guess, confident
+        except Exception:
+            pass
+
+    return "technology", False
 
 
 # --------------------------------------------------------------------------
 # Competitor discovery
 # --------------------------------------------------------------------------
+
+# Mega-caps only ever count as a competitor when real head-to-head evidence
+# names them (require_vs=True) — never through the loose category fallback,
+# which is how "Apple / Alphabet / AMD" leaked in as fake competitors for
+# small or made-up companies whose industry couldn't be confidently detected.
+MEGA_CAPS = {
+    "apple", "google", "alphabet", "microsoft", "amazon", "meta", "facebook",
+    "samsung", "sony", "netflix", "nvidia", "tesla", "ibm", "oracle", "intel",
+    "amd", "salesforce", "adobe", "sap",
+}
+
+
+def is_mega_cap(name):
+    return (name or "").strip().lower() in MEGA_CAPS
+
 
 _CAP_NAME = re.compile(r"\b([A-Z][A-Za-z0-9&.']+(?:[ \-][A-Z][A-Za-z0-9&.']+){0,2})\b")
 _LIST_CUE = re.compile(
@@ -504,8 +701,17 @@ def _clean_candidate(name, company):
     words = low.split()
     if len(words) > 4:
         return None
-    # ANY junk token disqualifies: kills "World's Top EdTech", "United States"
-    if any(w.strip(".'’s") in NOISE_NAMES for w in words):
+    # ANY junk token disqualifies: kills "World's Top EdTech", "United States".
+    # NB: strip a trailing possessive ('s / 's) with a targeted regex, not
+    # str.strip(".'’s") — that treats the argument as a CHARACTER SET and
+    # strips 's' from both ends of ANY word, silently mangling "services"
+    # into "ervice" and "solutions" into "olution" so they'd never match
+    # the (correctly spelled, plural) NOISE_NAMES entries. That single bug
+    # is why generic words like "Services" were leaking through as if they
+    # were real competitor names.
+    def _norm_word(w):
+        return re.sub(r"[’']s$", "", w).strip(".,'’\"")
+    if any(_norm_word(w) in NOISE_NAMES for w in words):
         return None
     if any(ch.isdigit() for ch in name) and not re.match(r"^[A-Za-z]+\d+$", name):
         return None
@@ -538,12 +744,21 @@ def _mine_candidates(texts, company):
     return sorted(merged.values(), key=lambda x: -x[1])
 
 
-def find_competitors(company, industry, max_competitors=8, progress=None):
+def find_competitors(company, industry, max_competitors=8, progress=None,
+                      industry_confident=True):
+    # Kept to 5 queries (trimmed from 7) — each web_search costs real time
+    # and is exposed to rate-limiting, so redundant phrasings were cut.
     queries = [
         f"{company} top competitors",
         f"{company} alternatives {industry}",
-        f"top {industry} companies competing with {company}",
         f"{company} vs",
+        # Company-anchored, industry-agnostic: these find real competitors
+        # for niche/local businesses whose industry doesn't cleanly match a
+        # known category, WITHOUT the risk of the generic category fallback
+        # below (pulling unrelated big names) — a fictitious company simply
+        # won't have any real pages using these phrases either.
+        f"companies like {company}",
+        f"{company} similar companies",
     ]
     serp_results = []
     texts = []  # STRUCTURED evidence only — no loose words from headlines
@@ -581,7 +796,9 @@ def find_competitors(company, industry, max_competitors=8, progress=None):
 
     ranked = _mine_candidates(texts, company)
     # keep only candidates seen with meaningful support
-    ranked = [(n, s) for n, s in ranked if s >= 3][: max_competitors + 4]
+    # Buffer trimmed from +4 to +2 — each extra candidate costs up to 2 more
+    # web_search calls in verify_competitor, real time exposed to rate limits.
+    ranked = [(n, s) for n, s in ranked if s >= 3][: max_competitors + 2]
     print(f"[competitors] candidates: {[(n, s) for n, s in ranked]}", flush=True)
 
     competitors = []
@@ -601,7 +818,11 @@ def find_competitors(company, industry, max_competitors=8, progress=None):
 
     # Small/unknown company fallback: no head-to-head pages exist on the web,
     # so pull the leading players of the same industry as the competitive set.
-    if len(competitors) < 3 and not out_of_time():
+    # Only safe to do this when the industry itself is a confident, real
+    # signal — otherwise (e.g. a made-up company defaulting to generic
+    # "technology") this pulls category giants like Apple/Alphabet as fake
+    # "competitors" for a company that may not even exist.
+    if len(competitors) < 3 and not out_of_time() and industry_confident:
         print(f"[competitors] falling back to category search for {industry}",
               flush=True)
         rs = web_search(f"top {industry} companies", 8)
@@ -664,6 +885,8 @@ def verify_competitor(name, company, industry, require_vs=True):
     context — AND its description matches the industry. With require_vs=False
     (category fallback for small companies) the industry match alone decides."""
     nl, cl = name.lower(), company.lower()
+    if not require_vs and is_mega_cap(name):
+        return False, "", ""
     vs_pat = re.compile(
         r"(?:{n}.{{0,30}}\b(?:vs|versus)\b\.?.{{0,30}}{c}|"
         r"{c}.{{0,30}}\b(?:vs|versus)\b\.?.{{0,30}}{n})"
@@ -707,7 +930,21 @@ def verify_competitor(name, company, industry, require_vs=True):
             if not desc and len(snip) > 60 and _COMPANYISH.search(snip):
                 desc = snip[:260].rsplit(" ", 1)[0]
             if not website and not any(d in dom for d in DIRECTORY_DOMAINS):
-                if slug[:6] in dom.replace("-", "").replace(".", ""):
+                dom_slug = dom.replace("-", "").replace(".", "")
+                # require_vs=False (category fallback) has no real
+                # head-to-head evidence at all, so a coincidental substring
+                # match is dangerously easy to satisfy — a real run had
+                # "Erik" (a testimonial's first name, 4 letters) match some
+                # unrelated domain that happened to contain "erik" anywhere.
+                # Require the domain to actually START WITH a substantial
+                # slice of the name, and don't even try for short/common
+                # names where a coincidence is likely.
+                slug_match = (
+                    dom_slug.startswith(slug[:10]) if not require_vs and len(slug) >= 5
+                    else slug[:6] in dom_slug if require_vs
+                    else False
+                )
+                if slug_match:
                     website = "https://" + dom
     if not desc:
         for r in rs + rs2:  # fall back to the vs-page snippet
@@ -715,13 +952,25 @@ def verify_competitor(name, company, industry, require_vs=True):
             if nl in r["title"].lower() and len(snip) > 60:
                 desc = snip[:260].rsplit(" ", 1)[0]
                 break
-    if desc and not website:
+    if desc and not website and require_vs:
+        # Loose "pick any non-directory domain" fallback — acceptable only
+        # when require_vs already gave us strong head-to-head evidence.
         for r in rs2:
             dom = urlparse(r["url"]).netloc.lower().replace("www.", "")
             if not any(d in dom for d in DIRECTORY_DOMAINS):
                 website = "https://" + dom
                 break
-    ok = bool(desc) and _same_domain(desc, industry, company)
+    if require_vs:
+        ok = bool(desc) and _same_domain(desc, industry, company)
+    else:
+        # Category fallback has no real head-to-head evidence at all — a
+        # description "matching the industry" is trivially true for almost
+        # any industry-relevant noun (an exam name like "MCAT", a generic
+        # word like "Trust"/"Services"), which is exactly how those leaked
+        # in as fake "competitors". Also require an actual matching website
+        # domain: real companies almost always have one; generic words and
+        # exam acronyms essentially never do.
+        ok = bool(desc) and bool(website) and _same_domain(desc, industry, company)
     return ok, desc, website
 
 
@@ -776,6 +1025,54 @@ BUYER_PERSONAS = [
 
 GENERIC_BUYERS = ["Head of Operations", "Procurement Manager",
                   "Business Owner", "Managing Director"]
+
+# GATEKEEPERS: people in DAILY contact with the product's END USERS — the
+# professor who tells students about a study-abroad platform, the chef who
+# picks the delivery apps, the GP who recommends the health app. They don't
+# sign the cheque, but they make or break adoption.
+AUDIENCE_GATEKEEPERS = [
+    (("student", "education", "edtech", "test prep", "study abroad",
+      "tutoring", "college", "university", "exam", "campus", "school",
+      "learning", "sat", "ielts", "admission"),
+     ["Professor", "School Teacher", "Career Counselor",
+      "Study Abroad Consultant", "Coaching Institute Director",
+      "Student Activities Coordinator"]),
+    (("food delivery", "restaurant", "dining", "food and beverage"),
+     ["Chef", "Food Blogger", "Restaurant Consultant", "Food Court Manager"]),
+    (("health", "clinic", "patient", "pharma", "medical", "wellness"),
+     ["General Practitioner", "Pharmacist", "Physiotherapist", "Nutritionist"]),
+    (("developer", "devops", "cloud", "software", "saas", "api"),
+     ["Developer Advocate", "Tech Community Organizer", "Bootcamp Instructor",
+      "Engineering Mentor"]),
+    (("travel", "hotel", "tourism", "trip"),
+     ["Travel Agent", "Tour Guide", "Hotel Concierge", "Travel Blogger"]),
+    (("invest", "trading", "brokerage", "fintech", "banking", "insurance"),
+     ["Financial Advisor", "Chartered Accountant", "Wealth Manager",
+      "Insurance Agent"]),
+    (("design", "creative", "prototyp"),
+     ["Design Educator", "Design Community Organizer", "Freelance Designer"]),
+    (("marketing", "brand", "seo", "advertis"),
+     ["Marketing Consultant", "Agency Owner", "Brand Strategist"]),
+    (("fitness", "gym", "sport"),
+     ["Personal Trainer", "Gym Owner", "Sports Coach"]),
+]
+
+GENERIC_GATEKEEPERS = ["Industry Consultant", "Community Manager",
+                       "Trade Association Director"]
+
+
+def gatekeeper_roles(industry, positioning):
+    """Who talks to this product's end users every single day?"""
+    blob = (industry + " " + positioning.get("description", "") + " " +
+            positioning.get("tagline", "") + " " +
+            positioning.get("h1", "")).lower()
+    roles = []
+    for keys, gk_roles in AUDIENCE_GATEKEEPERS:
+        if any(k in blob for k in keys):
+            roles.extend(r for r in gk_roles if r not in roles)
+        if len(roles) >= 6:
+            break
+    return roles[:6] if roles else GENERIC_GATEKEEPERS
 
 
 def buyer_roles(industry, positioning):
@@ -834,23 +1131,30 @@ def _parse_linkedin_result(r, company_hint):
     }
 
 
-def find_leads(company, industry, positioning, max_leads=50):
+def find_leads(company, industry, positioning, location="", max_leads=50):
     """Prospective CLIENTS worldwide: real people whose job title matches
     the buyer personas for this product — the people an outbound motion
-    would actually pitch. Targets 50 contacts across personas."""
+    would actually pitch. Targets 50 contacts across personas.
+
+    Every query variant is anchored to industry and/or location — a bare
+    "{role} linkedin profile" query with no qualifier returns the exact same
+    people for any two searches that share a generic fallback persona, which
+    is why leads used to look identical across unrelated companies."""
     roles = buyer_roles(industry, positioning)
     print(f"[leads] buyer personas: {roles}", flush=True)
     leads, seen, sources = [], set(), []
     ind_short = " ".join(industry.split()[:2])
+    loc_q = f" {location}" if location else ""
     per_role = max(6, max_leads // max(len(roles), 1) + 2)
     for role in roles:
         if len(leads) >= max_leads or out_of_time():
             break
+        # Trimmed from 4 to 3 variants — the dropped one duplicated ground
+        # already covered by the first, more precise site: query.
         queries = [
-            f'site:linkedin.com/in "{role}" {ind_short}',
-            f'site:linkedin.com/in "{role}"',
-            f'"{role}" {ind_short} linkedin.com/in',
-            f'"{role}" linkedin profile',
+            f'site:linkedin.com/in "{role}" {ind_short}{loc_q}',
+            f'site:linkedin.com/in "{role}"{loc_q or " " + ind_short}',
+            f'"{role}"{loc_q} {ind_short} linkedin profile',
         ]
         got_for_role = 0
         for q in queries:
@@ -866,10 +1170,300 @@ def find_leads(company, industry, positioning, max_leads=50):
                 if not lead["company"]:
                     lead["company"] = "—"
                 lead["persona"] = role
+                lead["segment"] = "b2b"
+                lead["lead_type"] = "decision_maker"
                 seen.add(lead["linkedin_url"])
                 leads.append(lead)
                 sources.append(lead["linkedin_url"])
                 got_for_role += 1
+    return leads, sources
+
+
+# --------------------------------------------------------------------------
+# B2C reach — real people don't buy through a procurement process the way
+# organizations do. Two kinds of B2C lead:
+#   1. VENUES: public businesses the target audience physically visits
+#      (coaching institutes, cafes, gyms, gamezones...) — outreach targets
+#      for partnerships/promos/ads, not private individuals.
+#   2. INDIVIDUALS: public creators/community accounts that self-publish a
+#      contact (an Instagram/YouTube bio email) — kept strictly best-effort
+#      and public-only; nothing here is scraped private contact data.
+# --------------------------------------------------------------------------
+
+CONSUMER_VENUES = [
+    (("student", "education", "edtech", "test prep", "study abroad",
+      "tutoring", "college", "university", "exam", "campus", "school",
+      "learning", "admission"),
+     ["Coaching Institute", "Cafe near college", "Gaming Zone", "Bookstore",
+      "Hostel"]),
+    (("food delivery", "restaurant", "dining", "food and beverage",
+      "cloud kitchen"),
+     ["Restaurant", "Cafe", "Cloud Kitchen", "Food Court"]),
+    (("fitness", "gym", "sport", "wellness"),
+     ["Gym", "Sports Academy", "Yoga Studio", "Nutrition Store"]),
+    (("fintech", "payment", "banking", "invest", "insurance", "trading"),
+     ["Co-working Space", "Business Networking Club"]),
+    (("travel", "hotel", "tourism", "trip"),
+     ["Travel Agency", "Tour Operator", "Backpacker Hostel"]),
+    (("gaming", "esports"),
+     ["Gaming Cafe", "Esports Arena", "Gaming Zone"]),
+    (("retail", "ecommerce", "e-commerce", "commerce", "fashion", "store"),
+     ["Shopping Mall", "Retail Market", "Fashion Store"]),
+    (("real estate", "property"),
+     ["Real Estate Agency", "Property Consultant Office"]),
+    (("health", "medical", "clinic", "pharma"),
+     ["Clinic", "Pharmacy", "Wellness Center"]),
+]
+
+GENERIC_VENUES = ["Community Center", "Co-working Space", "Popular Cafe"]
+
+_EMAIL_RE = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
+_PHONE_RE = re.compile(
+    r"(?:\+?\d{1,3}[-.\s]?)?\(?\d{2,4}\)?[-.\s]?\d{3,4}[-.\s]?\d{3,4}")
+_SOCIAL_DOMAINS = ("instagram.com", "youtube.com", "twitter.com", "x.com",
+                   "facebook.com")
+
+
+def venue_categories(industry, positioning):
+    """Which kinds of local venues does this product's audience frequent?"""
+    blob = (industry + " " + positioning.get("description", "") + " " +
+            positioning.get("tagline", "") + " " +
+            positioning.get("h1", "")).lower()
+    cats = []
+    for keys, venues in CONSUMER_VENUES:
+        if any(k in blob for k in keys):
+            cats.extend(v for v in venues if v not in cats)
+        if len(cats) >= 6:
+            break
+    return cats[:6] if cats else GENERIC_VENUES
+
+
+# A search result title like "10 Best Coaching Institutes in HSR Layout —
+# JustDial" is a LISTICLE — the title names an article, not a business. It
+# must never be stored as if it were one venue's name; the real names live
+# INSIDE that page and have to be mined out of it, the same way
+# find_competitors fetches "alternatives" pages instead of trusting headlines.
+_LISTICLE_TITLE = re.compile(
+    r"\b(\d{1,3}\s*\+?\s*(?:best|top)|top\s*\d|best\s*\d|"
+    r"\btop\b.{0,20}\bin\b|\bbest\b.{0,20}\bin\b)", re.I)
+_VENUE_NOISE = re.compile(
+    r"\b(best|top|list|guide|review|reviews|rated|ranked|places?\s+to|"
+    r"you must|near me|things to do|20\d{2}|"
+    # website navigation / UI chrome — a real run showed these leaking
+    # through from a page's nav menu, footer link list, or tag cloud as if
+    # they were business names ("About Us", "Contact", "Blog", "Casino"
+    # from a gaming-zone site's own nav; "Categories", "Community", "Job
+    # Search" from a blog's sidebar)
+    r"home|about us|about|contact us|contact|blog|blogs|categor(?:y|ies)|"
+    r"community|coliving|job search|career growth|career\s+and\s+education|"
+    r"city life|faqs?|privacy policy|terms|sitemap|subscribe|newsletter|"
+    r"sign up|sign in|login|register|follow us|social media|share|"
+    r"related posts?|recent posts?|popular posts?|tags?|archive|search|"
+    r"menu|navigation|team building|casino|games?|"
+    # promotional/nav copy seen in a real run scraping a booking-site
+    # listing page ("Popular Places in Bangalore", "Alternatives to
+    # Hostels in Bangalore?", "Other Locations in India", "Hostels in
+    # Bangalore from Just $4")
+    r"popular places|other locations|alternatives?\s+to|from\s+just|"
+    r"book\s+now|book\s+with|\d+%\s*off|discount|\bdeals?\b|\boffers?\b)\b",
+    re.I)
+# A random statistic ("72% of businesses...") or a pricing line ("Xbox
+# Gaming: ₹100 per hour") is never a business name.
+_VENUE_NUMERIC_NOISE = re.compile(r"\d+\s*%|[₹$€£]\s*\d|\d\s*[₹$€£]")
+
+
+def _clean_venue_name(title):
+    name = re.split(r"[|–—]", title)[0].strip()
+    name = re.sub(r"^\d+[.)]\s*", "", name).strip(" -,.")
+    if len(name) < 3 or len(name) > 70 or len(name.split()) > 8:
+        return None
+    return name
+
+
+def _has_nearby_description(tag, min_len=40):
+    """Genuine listicle entries are followed by 1+ sentences describing the
+    place; pure navigation/chrome (nav menus, tag clouds, footer links)
+    never is. This is the second, structural defense against mining page
+    chrome as if it were a business name — the noise-word list above can
+    only catch junk we've already seen, this catches junk we haven't."""
+    candidates = []
+    nxt = tag.find_next_sibling()
+    if nxt is not None:
+        candidates.append(nxt)
+    if tag.parent is not None:
+        p = tag.parent.find("p")
+        if p is not None:
+            candidates.append(p)
+    return any(len(c.get_text(" ", strip=True)) >= min_len for c in candidates)
+
+
+def _mine_venue_names(soup, cat, location, max_names=8):
+    """Pull real business names out of a listicle/directory page's headings
+    and list items — mirrors _mine_candidates' heading-scrape approach for
+    competitor "alternatives" pages."""
+    names, seen = [], set()
+    cat_l = cat.lower()
+    loc_l = (location or "").lower()
+    for tag in soup.select("h2, h3, h4, li"):
+        line = tag.get_text(" ", strip=True)
+        if not line or len(line) > 90:
+            continue
+        m = _NUMBERED.match(line)
+        cand = (m.group(1) if m else line)
+        cand = re.split(r"[|–—]", cand)[0].strip(" .,:-")
+        # Fold stylized unicode (mathematical bold/italic letters etc, a
+        # common trick to dodge plain-text filters — a real run had
+        # "𝐁𝐨𝐨𝐤 𝐰𝐢𝐭𝐡 𝐅𝐑𝐄𝐄") back to plain ASCII before any filter runs.
+        cand = unicodedata.normalize("NFKC", cand)
+        if not (3 <= len(cand) <= 60) or len(cand.split()) > 8:
+            continue
+        if _VENUE_NOISE.search(cand) or _VENUE_NUMERIC_NOISE.search(cand):
+            continue
+        # A phrase describing the location/category itself, not a specific
+        # business ("Hostels in Bangalore from Just $4", "Popular Places in
+        # Bangalore") — real business names essentially never embed the
+        # city name as a descriptive clause like this.
+        if loc_l and len(loc_l) >= 4 and loc_l in cand.lower():
+            continue
+        cl = cand.lower()
+        # skip lines that are just the category/location repeated, not a
+        # real business name ("Coaching Institutes", "HSR Layout")
+        if cl == cat_l or cl == loc_l or cl in (cat_l + "s", cat_l + "es"):
+            continue
+        if cl in seen:
+            continue
+        if not _has_nearby_description(tag):
+            continue
+        seen.add(cl)
+        names.append(cand)
+        if len(names) >= max_names:
+            break
+    return names
+
+
+def find_b2c_venues(company, industry, positioning, location, max_venues=30):
+    """Public businesses the target audience visits — partnership/ad-outreach
+    targets, geo-targeted when a location is given. Most SERP hits for these
+    queries are "best/top N" listicles, so those get fetched and mined for
+    the real business names inside; only a genuinely single-business result
+    title is trusted directly."""
+    cats = venue_categories(industry, positioning)
+    loc_suffix = f" in {location}" if location else ""
+    venues, seen, sources = [], set(), []
+    per_cat = max(4, max_venues // max(len(cats), 1) + 1)
+    for cat in cats:
+        if len(venues) >= max_venues or out_of_time():
+            break
+        # One query per category (was two) — halves this section's search
+        # volume; "best" reliably surfaces listicles worth mining.
+        queries = [f"best {cat.lower()}{loc_suffix}"]
+        got, fetched = 0, 0
+        for q in queries:
+            if got >= per_cat or len(venues) >= max_venues:
+                break
+            for r in web_search(q, 10):
+                if got >= per_cat or len(venues) >= max_venues:
+                    break
+                if _LISTICLE_TITLE.search(r["title"]):
+                    if fetched >= 3 or out_of_time():
+                        continue
+                    _, soup = fetch_page_text(r["url"])
+                    fetched += 1
+                    if soup is None:
+                        continue
+                    for name in _mine_venue_names(soup, cat, location):
+                        if got >= per_cat or len(venues) >= max_venues:
+                            break
+                        if name.lower() in seen:
+                            continue
+                        seen.add(name.lower())
+                        venues.append({
+                            "name": name,
+                            "category": cat,
+                            "location": location or "",
+                            "contact": {"phone": "", "email": "", "website": ""},
+                            "source_url": r["url"],
+                            "segment": "b2c",
+                            "lead_type": "venue",
+                        })
+                        sources.append(r["url"])
+                        got += 1
+                    continue
+                # a genuine single-business result (own site or a directory's
+                # individual listing page, not an aggregation article)
+                dom = urlparse(r["url"]).netloc.lower()
+                if any(d in dom for d in DIRECTORY_DOMAINS):
+                    continue
+                name = _clean_venue_name(r["title"])
+                if not name or name.lower() in seen or _VENUE_NOISE.search(name):
+                    continue
+                blob = r["title"] + " " + r["snippet"]
+                email_m = _EMAIL_RE.search(blob)
+                phone_m = _PHONE_RE.search(blob)
+                seen.add(name.lower())
+                venues.append({
+                    "name": name,
+                    "category": cat,
+                    "location": location or "",
+                    "contact": {
+                        "phone": phone_m.group(0) if phone_m else "",
+                        "email": email_m.group(0) if email_m else "",
+                        "website": r["url"],
+                    },
+                    "source_url": r["url"],
+                    "segment": "b2c",
+                    "lead_type": "venue",
+                })
+                sources.append(r["url"])
+                got += 1
+    return venues, sources
+
+
+def find_b2c_individuals(company, industry, positioning, location, max_leads=20):
+    """Best-effort public creator/community contacts who self-publish an
+    email in their bio — never fabricated, kept strictly to what's actually
+    indexed. Availability of public self-published contacts is the limit,
+    not the code, so this is intentionally lower-volume than venue leads."""
+    # Must be a short noun phrase, not the site's own tagline sentence — a
+    # real run showed `positioning["h1"]` was "For Students and Parents who
+    # demand the best Test Prep", and quoting that whole sentence in a
+    # search query guarantees zero matches. `industry` is already a clean,
+    # short label (e.g. "test prep") thanks to the taxonomy classifier.
+    niche = industry.strip()
+    loc_suffix = f" {location}" if location else ""
+    leads, seen, sources = [], set(), []
+    queries = [
+        f'site:instagram.com "{niche}"{loc_suffix} email',
+        f'"{niche}"{loc_suffix} collab email instagram',
+        f'"{niche}" creator{loc_suffix} contact email',
+    ]
+    for q in queries:
+        if len(leads) >= max_leads or out_of_time():
+            break
+        for r in web_search(q, 10):
+            if len(leads) >= max_leads:
+                break
+            blob = r["title"] + " " + r["snippet"]
+            email_m = _EMAIL_RE.search(blob)
+            if not email_m:
+                continue
+            dom = urlparse(r["url"]).netloc.lower()
+            if not any(d in dom for d in _SOCIAL_DOMAINS):
+                continue
+            key = email_m.group(0).lower()
+            if key in seen:
+                continue
+            handle = r["title"].split("(")[0].split("|")[0].strip()[:60]
+            seen.add(key)
+            leads.append({
+                "name": handle or "—",
+                "platform": dom.replace("www.", ""),
+                "contact": {"email": email_m.group(0)},
+                "source_url": r["url"],
+                "segment": "b2c",
+                "lead_type": "individual",
+            })
+            sources.append(r["url"])
     return leads, sources
 
 
