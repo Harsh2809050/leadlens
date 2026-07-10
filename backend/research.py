@@ -699,6 +699,11 @@ def detect_industry(company, positioning=None):
                             r"popular|proprietary|free|online|web.based|the)"
                             r"\s+)+", "", phrase)
             phrase = re.sub(r"\s+", " ", phrase).strip(" -,.")
+            # a real category label never contains pronouns/infinitives —
+            # kills mangled captures like "this talent to learn"
+            if re.search(r"\b(this|that|these|those|it|its|to|your|our|you|we)\b",
+                         phrase):
+                continue
             if 4 <= len(phrase) <= 60:
                 # prefer what comes after "for" ("web application for interface design")
                 tail = phrase.split(" for ")[-1].strip()
@@ -1414,6 +1419,12 @@ def find_b2c_venues(company, industry, positioning, location, max_venues=30):
     queries are "best/top N" listicles, so those get fetched and mined for
     the real business names inside; only a genuinely single-business result
     title is trusted directly."""
+    # Without a city the venue queries are hopelessly generic ("best cafe
+    # near college") and mine listicle garbage from around the world — a
+    # real run returned "The taste is enjoyable" as a venue. Geo-targeting
+    # is the whole point of this section; skip it honestly when absent.
+    if not (location or "").strip():
+        return [], []
     cats = venue_categories(industry, positioning)
     loc_suffix = f" in {location}" if location else ""
     venues, seen, sources = [], set(), []
