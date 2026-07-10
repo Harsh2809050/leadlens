@@ -309,7 +309,73 @@ def _brave_api(query, max_results=10):
     ]
 
 
+# ---- free, key-less power engines ----------------------------------------
+try:  # the ddgs library speaks DuckDuckGo's real protocol (vqd tokens etc.)
+    from ddgs import DDGS as _DDGS_CLS
+except ImportError:
+    try:
+        from duckduckgo_search import DDGS as _DDGS_CLS
+    except ImportError:
+        _DDGS_CLS = None
+
+
+def _ddgs_lib(query, max_results=10):
+    """DuckDuckGo via the `ddgs` library — free, no key, and far more
+    reliable than raw HTML scraping because it negotiates DDG's anti-bot
+    tokens the way a real client does."""
+    if _DDGS_CLS is None:
+        return []
+    results = []
+    with _DDGS_CLS() as d:
+        for r in d.text(query, max_results=max_results):
+            url = r.get("href") or r.get("url") or ""
+            title = r.get("title", "")
+            if not url.startswith("http") or not title:
+                continue
+            results.append({"title": title, "url": url,
+                            "snippet": r.get("body", "") or r.get("description", "")})
+    return results
+
+
+# Public SearXNG metasearch instances with the JSON API enabled — each one
+# aggregates Google/Bing/DDG server-side, for free, no key. Instances come
+# and go; the per-engine circuit breaker handles dead ones automatically.
+SEARXNG_INSTANCES = [
+    "https://searx.be",
+    "https://search.inetol.net",
+    "https://searx.tiekoetter.com",
+    "https://priv.au",
+    "https://opnxng.com",
+]
+
+
+def _searxng(query, max_results=10):
+    insts = list(SEARXNG_INSTANCES)
+    random.shuffle(insts)
+    for inst in insts[:3]:
+        try:
+            with _client() as c:
+                r = c.get(f"{inst}/search",
+                          params={"q": query, "format": "json"})
+            if r.status_code != 200:
+                continue
+            data = r.json()
+            results = []
+            for x in data.get("results", [])[:max_results]:
+                url = x.get("url", "")
+                if not url.startswith("http"):
+                    continue
+                results.append({"title": x.get("title", ""), "url": url,
+                                "snippet": x.get("content", "")})
+            if results:
+                return results
+        except Exception:
+            continue
+    return []
+
+
 ENGINES = [
+    ("ddgs_lib", _ddgs_lib),
     ("ddg_lite", _ddg_lite),
     ("ddg_html", _ddg_search),
     ("bing", _bing_search),
@@ -317,6 +383,7 @@ ENGINES = [
     ("ecosia", _ecosia_search),
     ("brave", _brave_search),
     ("mojeek", _mojeek_search),
+    ("searxng", _searxng),
 ]
 if BRAVE_API_KEY:
     ENGINES.insert(0, ("brave_api", _brave_api))
