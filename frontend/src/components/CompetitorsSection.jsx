@@ -1,13 +1,35 @@
+import { useState } from "react";
 import { SectionHeader, EmptyState } from "./ui.jsx";
+
+function Favicon({ website, name }) {
+  const domain = website
+    ? website.replace(/^https?:\/\//, "").split("/")[0]
+    : "";
+  const [err, setErr] = useState(false);
+  if (!domain || err) {
+    return (
+      <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-gradient-to-br from-indigo-500 to-violet-600 text-sm font-bold text-white">
+        {name.slice(0, 1)}
+      </div>
+    );
+  }
+  return (
+    <img
+      src={`https://www.google.com/s2/favicons?domain=${domain}&sz=64`}
+      alt=""
+      onError={() => setErr(true)}
+      className="h-9 w-9 shrink-0 rounded-lg border border-slate-700/60 bg-slate-800 p-1.5"
+      loading="lazy"
+    />
+  );
+}
 
 function CompetitorCard({ c }) {
   return (
     <div className="tcard group rounded-xl border border-slate-800 bg-slate-900/60 p-5 transition hover:border-indigo-500/40 hover:bg-slate-900 hover:shadow-lg hover:shadow-indigo-500/5">
       <div className="flex items-start justify-between gap-3">
         <div className="flex items-center gap-3">
-          <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-gradient-to-br from-indigo-500 to-violet-600 text-sm font-bold text-white">
-            {c.name.slice(0, 1)}
-          </div>
+          <Favicon website={c.website} name={c.name} />
           <div>
             <h3 className="font-semibold text-white">{c.name}</h3>
             {c.website && (
