@@ -1966,13 +1966,37 @@ def resolve_from_url(url):
         if soup.title:
             title = soup.title.get_text(strip=True)
             positioning["tagline"] = title[:160]
-            # A page title is usually "Brand Name - Tagline" or "Brand | Tagline"
-            # — the first clean segment is almost always the real brand name,
-            # and a better display name than a mechanical domain-slug guess
-            # (keeps real capitalization/punctuation like "Cult.fit").
-            first_seg = re.split(r"[-|–—:]", title)[0].strip()
-            if 2 <= len(first_seg) <= 40:
-                company = first_seg
+            # A page title is "Brand - Tagline" for some sites and "Tagline |
+            # Brand" for others — Notion's real title is "The AI workspace
+            # that works for you | Notion", brand LAST, which a naive
+            # "always take the first segment" guess got wrong (picked the
+            # tagline as the company name). Instead, find whichever segment
+            # actually matches the domain slug — that's unambiguous — and
+            # only fall back to a positional guess if nothing matches.
+            segments = [s.strip() for s in re.split(r"[-|–—:]", title) if s.strip()]
+            slug_key = re.sub(r"[^a-z0-9]", "", slug.lower())
+            best = None
+            if slug_key:
+                for seg in segments:
+                    seg_key = re.sub(r"[^a-z0-9]", "", seg.lower())
+                    if seg_key and (slug_key in seg_key or seg_key in slug_key) \
+                            and 2 <= len(seg) <= 40:
+                        best = seg
+                        break
+            if not best:
+                # No segment matched the domain at all — brand names are
+                # almost always shorter than taglines, so the shortest
+                # reasonable segment is a better guess than "always first".
+                # Skip generic page-chrome words ("Home", "Welcome") that
+                # would be a worse guess than the domain-derived name itself.
+                generic = {"home", "welcome", "login", "sign in", "official site",
+                          "official website", "index"}
+                short_segs = [s for s in segments
+                             if 2 <= len(s) <= 25 and s.lower() not in generic]
+                if short_segs:
+                    best = min(short_segs, key=len)
+            if best:
+                company = best
         meta = soup.find("meta", attrs={"name": "description"}) or soup.find(
             "meta", attrs={"property": "og:description"})
         if meta and meta.get("content"):
