@@ -20,6 +20,7 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
+import apollo_client
 import db
 import llm
 import report as report_mod
@@ -43,7 +44,7 @@ def _lock_for(key):
         return _locks.setdefault(key, threading.Lock())
 
 
-TOTAL_RESEARCH_BUDGET = 240
+TOTAL_RESEARCH_BUDGET = 450
 # Per-section ceilings (seconds). A single global deadline let competitor
 # verification (expensive: up to 2 web_search calls per candidate) consume
 # the ENTIRE budget under degraded/rate-limited search conditions, leaving
@@ -51,8 +52,22 @@ TOTAL_RESEARCH_BUDGET = 240
 # came back with 3 good competitors but leads=[] entirely empty. Giving each
 # section its own slice of whatever budget remains means one slow section
 # can no longer starve every section after it.
-SECTION_CAPS = {"competitors": 70, "leads": 70, "venues": 35,
-                "individuals": 20, "trends": 20}
+# competitors gets more than leads: it's the first section, so it's the one
+# that pays the cost of discovering the search engines are rate-limited
+# (each empty query eats a 5s backoff before the fast-fail path kicks in —
+# see research.set_deadline) — a real run only got through 1 of 10
+# well-ranked candidates before its 70s ran out. leads consistently returns
+# 40-50 results well within 70s, so it has slack to give up.
+# Raised from 240/95/60/35/20/20 now that /api/search/start + /api/search/poll
+# means a slow run shows live progress instead of looking like a hard
+# failure — these ceilings only ever get PAID on bad (rate-limited) days,
+# since every section exits early the moment it has enough results. More
+# patience on bad days costs nothing on good ones.
+# Raised leads/venues/individuals to match the wider query sets added to
+# research.py (more queries per section = more time needed to pay them off,
+# especially on a rate-limited day when every query eats a 5s backoff).
+SECTION_CAPS = {"competitors": 140, "leads": 120, "venues": 90,
+                "individuals": 50, "trends": 30}
 
 
 def _section_deadline(t_start, section):
@@ -83,7 +98,28 @@ def run_research(company: str, industry: str, location: str = "",
     sources.extend(comp_sources)
 
     _section_deadline(t_start, "leads")
-    leads, lead_sources = research.find_leads(company, industry, positioning, location)
+    if apollo_client.available():
+        # Apollo is a real people/company database, not search-engine
+        # scraping — it doesn't hit the rate-limiting or noisy-title-
+        # parsing problems research.find_leads does. Preferred whenever a
+        # key is configured; falls back to scraping only if Apollo errors
+        # or comes back thin (e.g. a very niche role with no matches).
+        roles = research.buyer_roles(industry, positioning)
+        print(f"[leads] using Apollo for buyer personas: {roles}", flush=True)
+        try:
+            leads, lead_sources = apollo_client.find_leads(roles, location)
+        except Exception as e:
+            print(f"[apollo] find_leads crashed, falling back to scraping: {e}",
+                  flush=True)
+            leads, lead_sources = [], []
+        if len(leads) < 10:
+            extra, extra_sources = research.find_leads(
+                company, industry, positioning, location, max_leads=60 - len(leads))
+            seen_urls = {l["profile_url"] for l in leads}
+            leads.extend(l for l in extra if l["profile_url"] not in seen_urls)
+            lead_sources.extend(extra_sources)
+    else:
+        leads, lead_sources = research.find_leads(company, industry, positioning, location)
     sources.extend(lead_sources)
 
     _section_deadline(t_start, "venues")
@@ -238,6 +274,80 @@ def get_or_research(company: str, industry: str, location: str = "",
 def api_search(company: str = Query(...), industry: str = Query(""),
                location: str = Query(""), refresh: int = 0):
     return get_or_research(company, industry, location, refresh == 1)
+
+
+# ---- async start/poll ------------------------------------------------
+# A first-time (uncached) research run regularly takes 2-4 minutes once
+# search engines are rate-limiting this machine (see SECTION_CAPS above).
+# The synchronous /api/search endpoint holds that whole HTTP request open
+# for the entire duration — a real run showed the browser getting a 502
+# from an intermediary gateway/proxy well before the backend finished,
+# surfacing as "Research failed" in the UI even though the research was
+# still running fine underneath and cached successfully seconds later.
+# /api/search/start returns almost instantly (cache hit, or "a background
+# thread is now running"); the frontend polls /api/search/poll every few
+# seconds instead of holding one long request open, so no single HTTP
+# round-trip is ever slow enough to hit an external timeout.
+_jobs = {}
+_jobs_guard = threading.Lock()
+
+
+def _job_key(company, location):
+    return ((company or "").strip().lower(), (location or "").strip().lower())
+
+
+@app.get("/api/search/start")
+def api_search_start(company: str = Query(...), industry: str = Query(""),
+                     location: str = Query(""), refresh: int = 0):
+    company = (company or "").strip()
+    location = (location or "").strip()
+    industry = (industry or "").strip()
+    if not company:
+        raise HTTPException(status_code=422, detail="company is required")
+
+    if not refresh:
+        cached = (db.find_by_company(company, location) if not industry
+                  else db.get_cached(company, industry, location))
+        if cached:
+            return {"status": "done", "data": cached}
+
+    jkey = _job_key(company, location)
+    with _jobs_guard:
+        existing = _jobs.get(jkey)
+        if existing and existing["status"] == "running":
+            return {"status": "started"}
+        _jobs[jkey] = {"status": "running", "data": None, "detail": None,
+                       "started_at": time.time()}
+
+    def _worker():
+        try:
+            data = get_or_research(company, industry, location, refresh == 1)
+            with _jobs_guard:
+                _jobs[jkey] = {"status": "done", "data": data,
+                               "detail": None, "started_at": time.time()}
+        except HTTPException as e:
+            with _jobs_guard:
+                _jobs[jkey] = {"status": "error", "data": None,
+                               "detail": e.detail, "started_at": time.time()}
+        except Exception as e:
+            traceback.print_exc()
+            with _jobs_guard:
+                _jobs[jkey] = {"status": "error", "data": None,
+                               "detail": str(e), "started_at": time.time()}
+
+    threading.Thread(target=_worker, daemon=True).start()
+    return {"status": "started"}
+
+
+@app.get("/api/search/poll")
+def api_search_poll(company: str = Query(...), location: str = Query("")):
+    jkey = _job_key(company, location)
+    with _jobs_guard:
+        job = _jobs.get(jkey)
+    if not job:
+        raise HTTPException(status_code=404,
+                            detail="no research job found — call /api/search/start first")
+    return job
 
 
 @app.get("/api/competitors")

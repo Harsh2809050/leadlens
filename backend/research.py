@@ -289,9 +289,12 @@ BRAVE_API_KEY = os.environ.get("BRAVE_API_KEY", "")
 
 
 def _brave_api(query, max_results=10):
-    """Official Brave Search API (free tier: 2,000 queries/month).
-    Used automatically when BRAVE_API_KEY is set — essential on cloud
-    hosts whose datacenter IPs get blocked by search engines."""
+    """Official Brave Search API. As of Feb 2026 this is no longer free —
+    it's $5/month in credits (~1,000 queries), requires a card on file, and
+    bills overages with no spending cap. Used automatically when
+    BRAVE_API_KEY is set — most useful on cloud hosts whose datacenter IPs
+    get blocked by search engines more aggressively than home IPs, but
+    that tradeoff is now a real cost decision, not a free add-on."""
     if not BRAVE_API_KEY:
         return []
     with httpx.Client(timeout=10) as c:
@@ -393,7 +396,12 @@ _preferred_engine = [None]  # promotes the engine that last worked
 _serp_cache = {}            # query -> results, in-process — avoids repeat hits
 _engine_fails = {}          # engine -> consecutive EXCEPTIONS; 3+ = skip (process lifetime)
 _engine_empty_streak = {}   # engine -> consecutive EMPTY (but not erroring) results
-_engine_cooldown_until = {} # engine -> unix ts until which to skip it entirely
+# engine -> unix ts until which to skip it entirely. Loaded from disk at
+# import time and written back on every change — restarting the server used
+# to wipe this in-memory dict, forcing every fresh process to re-discover
+# "these 6 engines are currently benched" one 5s-backoff query at a time,
+# even one second after the previous process already knew it.
+_engine_cooldown_until = dict(db.get_engine_cooldowns())
 _deadline = [None]          # time budget for the CURRENT section (see main.py)
 _consecutive_empty = [0]    # queries in a row (current section) where EVERY
                             # engine returned zero results — controls the
@@ -410,9 +418,20 @@ def set_deadline(seconds):
     """Cap the CURRENT SECTION: past the deadline all searches return empty
     and that section finishes with whatever it has instead of spinning
     forever. Called once per pipeline section (see main.py's
-    _section_deadline) so one slow section can't starve the ones after it."""
+    _section_deadline) so one slow section can't starve the ones after it.
+
+    Does NOT reset _consecutive_empty — that used to happen here, which
+    meant every new section had to personally rediscover "all engines are
+    rate-limited" by burning through 5 more empty queries (each paying a
+    5s backoff) before it would fast-fail, even though the PREVIOUS section
+    already proved it seconds earlier and the real per-engine cooldowns
+    (5 min) far outlast a single ~4min run. A live run: zepto's competitor
+    section spent so long rediscovering this that only 2 of 10 well-ranked
+    candidates (including the #1-ranked "Blinkit") ever got a verification
+    attempt, and the individuals section afterward got ~0s of usable budget.
+    reset_run_stats() (called once per full run) is the only place this
+    should reset."""
     _deadline[0] = time.time() + seconds
-    _consecutive_empty[0] = 0  # fresh judgment for this section
 
 
 def reset_run_stats():
@@ -490,12 +509,15 @@ def web_search(query, max_results=10):
                 _serp_cache[query] = res
                 db.save_serp(query, res)
                 _consecutive_empty[0] = 0
+                if _engine_cooldown_until.pop(name, None) is not None:
+                    db.save_engine_cooldown(name, 0)  # recovered early — clear it on disk too
                 print(f"[search] {len(res):>2} results via {name}: {query!r}",
                       flush=True)
                 return res
             _engine_empty_streak[name] = _engine_empty_streak.get(name, 0) + 1
             if _engine_empty_streak[name] >= 4:
                 _engine_cooldown_until[name] = now + EMPTY_STREAK_COOLDOWN
+                db.save_engine_cooldown(name, _engine_cooldown_until[name])
                 print(f"[search] {name} benched for {EMPTY_STREAK_COOLDOWN}s "
                       f"after {_engine_empty_streak[name]} empty results in a row",
                       flush=True)
@@ -816,14 +838,54 @@ def _mine_candidates(texts, company):
     return sorted(merged.values(), key=lambda x: -x[1])
 
 
-def find_competitors(company, industry, max_competitors=8, progress=None,
+def _wikipedia_extract(company):
+    """Plain-text Wikipedia article for this company, if one exists —
+    Wikipedia's API has no practical rate limit for reasonable use (unlike
+    every general search engine this app depends on), so it's a source of
+    competitor/industry evidence that keeps working even when every search
+    engine is benched. Persisted through the same disk cache as SERP
+    results (14-day TTL) so a repeat lookup costs zero network calls."""
+    cache_key = f"wikipedia::{company.strip().lower()}"
+    cached = db.get_serp(cache_key)
+    if cached is not None:
+        return cached[0]["extract"] if cached else ""
+    if out_of_time():
+        return ""
+    text = ""
+    try:
+        with _client() as c:
+            resp = c.get(
+                "https://en.wikipedia.org/w/api.php",
+                params={"action": "query", "titles": company, "prop": "extracts",
+                       "explaintext": 1, "format": "json", "redirects": 1,
+                       "exchars": 4000},
+            )
+        if resp.status_code == 200:
+            pages = resp.json().get("query", {}).get("pages", {})
+            for page in pages.values():
+                if "missing" not in page:
+                    text = (page.get("extract") or "")[:4000]
+                    break
+    except Exception as e:
+        print(f"[wikipedia] lookup failed for {company!r}: {e}", flush=True)
+    db.save_serp(cache_key, [{"extract": text}] if text else [])
+    return text
+
+
+def find_competitors(company, industry, max_competitors=12, progress=None,
                       industry_confident=True):
-    # Kept to 5 queries (trimmed from 7) — each web_search costs real time
-    # and is exposed to rate-limiting, so redundant phrasings were cut.
+    # Expanded from 5 to 9 queries — the old set was consistently starving
+    # the mining stage of raw evidence, which is the root cause of "gives
+    # leads but very few" competitors: verify_competitor can only confirm
+    # candidates that showed up as mining candidates in the first place, so
+    # a thin query set caps the ceiling before verification even runs.
     queries = [
         f"{company} top competitors",
         f"{company} alternatives {industry}",
         f"{company} vs",
+        f"{company} competitors 2026",
+        f"best alternatives to {company}",
+        f"{industry} companies like {company}",
         # Company-anchored, industry-agnostic: these find real competitors
         # for niche/local businesses whose industry doesn't cleanly match a
         # known category, WITHOUT the risk of the generic category fallback
@@ -831,9 +893,26 @@ def find_competitors(company, industry, max_competitors=8, progress=None,
         # won't have any real pages using these phrases either.
         f"companies like {company}",
         f"{company} similar companies",
+        f"{company} market share competitors",
     ]
     serp_results = []
     texts = []  # STRUCTURED evidence only — no loose words from headlines
+
+    # Wikipedia is immune to the search-engine rate-limiting that starves
+    # every other part of this function — a real run went from 0 usable
+    # competitor candidates (every search engine benched) to a working set
+    # the moment this was added, since a notable company's article text
+    # alone can carry "X vs Zomato" or "competitors include A, B, C" prose.
+    wiki_text = _wikipedia_extract(company)
+    if wiki_text:
+        for m in _VS.finditer(wiki_text):
+            texts.append((3, m.group(1)))
+        for m in _LIST_CUE.finditer(wiki_text):
+            for part in re.split(r",|\band\b|&", m.group(1)):
+                part = part.strip()
+                if part:
+                    texts.append((2, part))
+
     for q in queries:
         rs = web_search(q, 10)
         serp_results.extend(rs)
@@ -848,11 +927,13 @@ def find_competitors(company, industry, max_competitors=8, progress=None,
                         texts.append((2, part))
 
     # Pull headings from the most promising comparison articles — the
-    # highest-quality source: list items on "alternatives" pages ARE names
+    # highest-quality source: list items on "alternatives" pages ARE names.
+    # Raised from 3 to 6 fetches — with 9 queries now feeding serp_results,
+    # 3 was leaving most "alternatives"/"comparison" pages entirely unmined.
     fetched = 0
     for r in serp_results:
         dom = urlparse(r["url"]).netloc.lower()
-        if fetched >= 3 or out_of_time():
+        if fetched >= 6 or out_of_time():
             break
         if any(d in dom for d in ("linkedin.com", "youtube.com", "reddit.com")):
             continue
@@ -867,17 +948,20 @@ def find_competitors(company, industry, max_competitors=8, progress=None,
                 fetched += 1
 
     ranked = _mine_candidates(texts, company)
-    # keep only candidates seen with meaningful support
-    # Buffer trimmed from +4 to +2 — each extra candidate costs up to 2 more
-    # web_search calls in verify_competitor, real time exposed to rate limits.
-    ranked = [(n, s) for n, s in ranked if s >= 3][: max_competitors + 2]
+    # keep only candidates seen with meaningful support. Buffer widened back
+    # to +6 (was +2) now that verify_competitor can skip its extra search
+    # round-trip for high-confidence candidates (see HIGH_CONFIDENCE_MINING_SCORE
+    # bypass below) — more candidates get a real shot at verification instead
+    # of being cut before they're even tried.
+    ranked = [(n, s) for n, s in ranked if s >= 3][: max_competitors + 6]
     print(f"[competitors] candidates: {[(n, s) for n, s in ranked]}", flush=True)
 
     competitors = []
     for name, score in ranked:
         if len(competitors) >= max_competitors or out_of_time():
             break
-        verified, desc, website = verify_competitor(name, company, industry)
+        verified, desc, website = verify_competitor(
+            name, company, industry, mining_score=score)
         print(f"[verify] {name}: {'OK' if verified else 'dropped'}", flush=True)
         if not verified:
             continue
@@ -894,16 +978,17 @@ def find_competitors(company, industry, max_competitors=8, progress=None,
     # signal — otherwise (e.g. a made-up company defaulting to generic
     # "technology") this pulls category giants like Apple/Alphabet as fake
     # "competitors" for a company that may not even exist.
-    if len(competitors) < 3 and not out_of_time() and industry_confident:
+    if len(competitors) < 5 and not out_of_time() and industry_confident:
         print(f"[competitors] falling back to category search for {industry}",
               flush=True)
         rs = web_search(f"top {industry} companies", 8)
         rs += web_search(f"best {industry} platforms", 6)
+        rs += web_search(f"leading {industry} providers", 6)
         # mine the list-article PAGES (headings = names), not their headlines
         cat_texts = []
         cat_fetched = 0
         for r in rs:
-            if cat_fetched >= 3 or out_of_time():
+            if cat_fetched >= 5 or out_of_time():
                 break
             dom = urlparse(r["url"]).netloc.lower()
             if any(d in dom for d in ("linkedin.com", "youtube.com", "reddit.com")):
@@ -951,7 +1036,10 @@ def _same_domain(desc, industry, company):
     return any(t[:6] in d for t in toks) if toks else True
 
 
-def verify_competitor(name, company, industry, require_vs=True):
+HIGH_CONFIDENCE_MINING_SCORE = 12
+
+
+def verify_competitor(name, company, industry, require_vs=True, mining_score=0):
     """A candidate only counts if the live web shows real head-to-head
     evidence: a '<name> vs <company>' title or an 'alternative to <company>'
     context — AND its description matches the industry. With require_vs=False
@@ -966,6 +1054,18 @@ def verify_competitor(name, company, industry, require_vs=True):
 
     verified = False
     rs = web_search(f"{name} vs {company}", 6)
+    # If this specific query got zero results while the run is already known
+    # to be rate-limited (was_rate_limited()), that's a search-infra failure,
+    # not evidence the candidate isn't a real competitor. A live run: "vs
+    # zepto" candidates were mined with real signal — Blinkit alone was named
+    # across 3+ independent "alternatives" pages (mining_score=38, by far the
+    # #1-ranked candidate) — but every engine was already benched from the
+    # PRIOR research run, so the verification query returned nothing and
+    # Blinkit got silently dropped despite being the most obvious real
+    # competitor. Only bypass for candidates with enough independent mining
+    # support that the risk of admitting junk is low (the _same_domain/desc
+    # check below still has to pass regardless).
+    engine_starved = not rs and was_rate_limited()
     # sub-brand guard: "Swiggy Instamart" style phrases mean the candidate
     # is the target's own product line, not a competitor
     combo_hits = sum(
@@ -983,7 +1083,23 @@ def verify_competitor(name, company, industry, require_vs=True):
             verified = True
             break
     if require_vs and not verified:
-        return False, "", ""
+        # A candidate named across several INDEPENDENT sources during mining
+        # (mining_score >= HIGH_CONFIDENCE_MINING_SCORE — e.g. it showed up
+        # on 4+ separate "alternatives"/"vs"/comparison pages) is already
+        # strong real-world evidence of a genuine competitor. Requiring it to
+        # ALSO win a fresh "X vs company" search was the main cause of "gives
+        # competitors but very few" — that follow-up query frequently finds
+        # nothing even for a real, well-known competitor simply because no
+        # page happens to phrase the comparison as "X vs Y" in an indexed
+        # title/snippet. Previously this bypass only fired when the run was
+        # ALSO already rate-limited (engine_starved); dropping that
+        # requirement lets well-evidenced candidates through on good days too.
+        if mining_score >= HIGH_CONFIDENCE_MINING_SCORE:
+            verified = True
+        elif engine_starved and mining_score >= HIGH_CONFIDENCE_MINING_SCORE - 4:
+            verified = True
+        else:
+            return False, "", ""
 
     # get a description + website from an independent query
     rs2 = web_search(f'"{name}" {industry} company', 6)
@@ -1162,24 +1278,55 @@ def buyer_roles(industry, positioning):
 
 _LI_TITLE_SPLIT = re.compile(r"\s+[-–—|]\s+")
 
-
-_LI_URL = re.compile(r"https?://[a-z]{0,3}\.?linkedin\.com/in/[A-Za-z0-9\-_%.]+")
-
 _BAD_LEAD_NAMES = {"sign in", "log in", "login", "linkedin", "join linkedin",
                    "sign up", "join now"}
 _ROLE_WORDS_IN_NAME = re.compile(
     r"\b(officer|principal|director|admissions?|training|placement|manager|"
     r"head|dean|professor|recruiter)\b", re.I)
+# A real run on "Zomato" returned "Wok Express" and "Hatam Restaurant" as
+# people (role "Owner") — the LinkedIn result was actually a BUSINESS page,
+# not a person, and nothing caught it because a business name and a person
+# name look identical to the length/capitalization checks above. Generic
+# food-business nouns are a cheap, high-precision signal a "name" is
+# actually a storefront.
+_BUSINESS_NAME_WORDS = re.compile(
+    r"\b(restaurant|express|kitchen|kitchens|cafe|café|eatery|kart|mart|"
+    r"foods?|dine|dining|biryani|pizza|bites|delivery|hub|zone|store|"
+    r"boutique|studio|salon|gym|academy|institute|clinic|hospital)\b", re.I)
+
+# Decision-maker profile sources beyond LinkedIn. Each has a stable
+# "/person-slug" URL shape AND a reliably structured search-result title
+# ("Name - Title at Company - <Site>") — the same two properties that make
+# LinkedIn scraping work at all. Sites without both (e.g. Twitter/X bios,
+# which rarely encode a job title in the indexed title/snippet) were left
+# out rather than bolted on with weaker matching that would just leak junk
+# leads into the same list.
+_LEAD_PLATFORMS = [
+    ("linkedin", "site:linkedin.com/in",
+     re.compile(r"https?://[a-z]{0,3}\.?linkedin\.com/in/[A-Za-z0-9\-_%.]+"),
+     (" | LinkedIn", " - LinkedIn")),
+    ("crunchbase", "site:crunchbase.com/person",
+     re.compile(r"https?://(?:www\.)?crunchbase\.com/person/[A-Za-z0-9\-]+"),
+     (" - Crunchbase Person Profile", " | Crunchbase", " - Crunchbase")),
+    ("wellfound", "site:wellfound.com/u",
+     re.compile(r"https?://(?:www\.)?wellfound\.com/u/[A-Za-z0-9\-]+"),
+     (" | Wellfound", " - Wellfound", " | AngelList", " - AngelList")),
+]
 
 
-def _parse_linkedin_result(r, company_hint):
-    m = _LI_URL.search(r["url"]) or _LI_URL.search(unquote(r["url"]))
+def _parse_profile_result(r, platform, url_pattern, title_suffixes):
+    m = url_pattern.search(r["url"]) or url_pattern.search(unquote(r["url"]))
     if not m:
         return None
     url = m.group(0)
-    # normalize country subdomains so in./au./www. duplicates collapse
-    url = re.sub(r"https?://[a-z]{0,3}\.?linkedin\.com", "https://www.linkedin.com", url)
-    parts = _LI_TITLE_SPLIT.split(r["title"].replace(" | LinkedIn", "").replace(" - LinkedIn", ""))
+    if platform == "linkedin":
+        # normalize country subdomains so in./au./www. duplicates collapse
+        url = re.sub(r"https?://[a-z]{0,3}\.?linkedin\.com",
+                     "https://www.linkedin.com", url)
+    title = r["title"]
+    for suf in title_suffixes:
+        title = title.replace(suf, "")
+    parts = _LI_TITLE_SPLIT.split(title)
     parts = [p.strip() for p in parts if p.strip() and p.strip().lower() != "linkedin"]
     if not parts:
         return None
@@ -1188,25 +1335,50 @@ def _parse_linkedin_result(r, company_hint):
         return None
     if name.lower() in _BAD_LEAD_NAMES or _ROLE_WORDS_IN_NAME.search(name):
         return None  # page chrome or a job title masquerading as a person
+    if _BUSINESS_NAME_WORDS.search(name):
+        return None  # a storefront/business page, not a person
     role = parts[1] if len(parts) > 1 else ""
-    company = company_hint
+    company = ""
     # titles are often "Name - Role at Company"
-    m = re.search(r"(.+?)\s+(?:at|@)\s+(.+)", role)
-    if m:
-        role, company = m.group(1).strip(), m.group(2).strip()
+    m2 = re.search(r"(.+?)\s+(?:at|@)\s+(.+)", role)
+    if m2:
+        role, company = m2.group(1).strip(), m2.group(2).strip()
     return {
         "name": name,
         "role": role[:80],
         "company": company[:60],
-        "linkedin_url": url.split("?")[0],
+        "profile_url": url.split("?")[0],
+        "platform": platform,
         "snippet": r["snippet"][:200],
     }
 
 
-def find_leads(company, industry, positioning, location="", max_leads=50):
+def _is_target_companys_own_person(r, company):
+    """The target company's OWN people (its founder, CEO, employees) rank
+    for generic buyer-persona searches about its own industry just as
+    easily as an actual prospect does — a real run searching "Zomato"
+    returned Zomato's own co-founder/CEO Deepinder Goyal as a "prospective
+    buyer" of Zomato, because his LinkedIn result matched a role-adjacent
+    query and nothing checked whether the result was actually ABOUT the
+    company being researched. Reject any result whose title/snippet names
+    the target company as a distinct word — a person who works there will
+    almost always have it in their headline or the snippet context."""
+    cl = company.strip().lower()
+    if len(cl) < 3:
+        return False
+    blob = (r["title"] + " " + r["snippet"]).lower()
+    return re.search(r"\b" + re.escape(cl) + r"\b", blob) is not None
+
+
+def find_leads(company, industry, positioning, location="", max_leads=60):
     """Prospective CLIENTS worldwide: real people whose job title matches
     the buyer personas for this product — the people an outbound motion
-    would actually pitch. Targets 50 contacts across personas.
+    would actually pitch. Targets 50 contacts across personas, sourced from
+    every profile platform in _LEAD_PLATFORMS (LinkedIn, Crunchbase,
+    Wellfound) — not LinkedIn alone. A real run showed LinkedIn-only
+    sourcing returning a near-identical roster run after run since it's a
+    single index; pulling from independently-indexed sites surfaces
+    different people for the same role/industry query.
 
     Every query variant is anchored to industry and/or location — a bare
     "{role} linkedin profile" query with no qualifier returns the exact same
@@ -1221,33 +1393,54 @@ def find_leads(company, industry, positioning, location="", max_leads=50):
     for role in roles:
         if len(leads) >= max_leads or out_of_time():
             break
-        # Trimmed from 4 to 3 variants — the dropped one duplicated ground
-        # already covered by the first, more precise site: query.
-        queries = [
-            f'site:linkedin.com/in "{role}" {ind_short}{loc_q}',
-            f'site:linkedin.com/in "{role}"{loc_q or " " + ind_short}',
-            f'"{role}"{loc_q} {ind_short} linkedin profile',
-        ]
         got_for_role = 0
-        for q in queries:
-            if got_for_role >= per_role or len(leads) >= max_leads:
+        for platform, site_q, url_pat, suffixes in _LEAD_PLATFORMS:
+            if got_for_role >= per_role or len(leads) >= max_leads or out_of_time():
                 break
-            for r in web_search(q, 10):
+            # Every platform now gets a second, looser variant (previously
+            # LinkedIn-only) — Crunchbase/Wellfound were consistently
+            # under-filled at one query each, capping total B2B volume well
+            # below the 50-60 target even when LinkedIn alone had headroom.
+            queries = [
+                f'{site_q} "{role}" {ind_short}{loc_q}',
+                f'{site_q} "{role}"{loc_q or " " + ind_short}',
+            ]
+            for q in queries:
                 if got_for_role >= per_role or len(leads) >= max_leads:
                     break
-                lead = _parse_linkedin_result(r, "")
-                if not lead or lead["linkedin_url"] in seen:
-                    continue
-                # their own employer parsed from the LinkedIn title
-                if not lead["company"]:
-                    lead["company"] = "—"
-                lead["persona"] = role
-                lead["segment"] = "b2b"
-                lead["lead_type"] = "decision_maker"
-                seen.add(lead["linkedin_url"])
-                leads.append(lead)
-                sources.append(lead["linkedin_url"])
-                got_for_role += 1
+                for r in web_search(q, 10):
+                    if got_for_role >= per_role or len(leads) >= max_leads:
+                        break
+                    if _is_target_companys_own_person(r, company):
+                        continue
+                    # We searched for this exact role phrase in quotes; a
+                    # result whose title/snippet doesn't contain ALL of its
+                    # words is an off-target match, not a real hit — a real
+                    # run searching "Restaurant Owner" surfaced a LinkedIn
+                    # result titled "Deepinder Goyal - Curious child." (a
+                    # snippet that also didn't match his real bio, likely a
+                    # stale/mismatched index entry) purely because a
+                    # degraded search engine returned it as filler, not a
+                    # genuine match. Word-set rather than exact-phrase so
+                    # "F&B Manager" still matches "F & B Manager" / reordered
+                    # phrasing without requiring identical punctuation.
+                    blob = (r["title"] + " " + r["snippet"]).lower()
+                    role_words = [w for w in re.split(r"[^a-z0-9&]+", role.lower())
+                                 if len(w) > 1]
+                    if not role_words or not all(w in blob for w in role_words):
+                        continue
+                    lead = _parse_profile_result(r, platform, url_pat, suffixes)
+                    if not lead or lead["profile_url"] in seen:
+                        continue
+                    if not lead["company"]:
+                        lead["company"] = "—"
+                    lead["persona"] = role
+                    lead["segment"] = "b2b"
+                    lead["lead_type"] = "decision_maker"
+                    seen.add(lead["profile_url"])
+                    leads.append(lead)
+                    sources.append(lead["profile_url"])
+                    got_for_role += 1
     return leads, sources
 
 
@@ -1271,6 +1464,19 @@ CONSUMER_VENUES = [
     (("food delivery", "restaurant", "dining", "food and beverage",
       "cloud kitchen"),
      ["Restaurant", "Cafe", "Cloud Kitchen", "Food Court"]),
+    # "quick-commerce"/"q-commerce" contains "commerce" as a raw substring,
+    # which was matching the generic retail/fashion bucket below instead —
+    # a real run on Zepto (grocery quick-commerce) got "Shopping Mall" /
+    # "Retail Market" / "Fashion Store" as its B2C venue categories, none
+    # of which are where a grocery-delivery app's actual audience or
+    # partnership targets are. This bucket needs to be matched BEFORE that
+    # happens, so its more relevant venues make it into the (shared,
+    # additive) category list too.
+    (("quick commerce", "quick-commerce", "q-commerce", "grocery",
+      "groceries", "instant delivery", "10 minute delivery",
+      "10-minute delivery", "hyperlocal delivery"),
+     ["Grocery Store", "Supermarket", "Residential Society",
+      "Corporate Park"]),
     (("fitness", "gym", "sport", "wellness"),
      ["Gym", "Sports Academy", "Yoga Studio", "Nutrition Store"]),
     (("fintech", "payment", "banking", "invest", "insurance", "trading"),
@@ -1305,9 +1511,9 @@ def venue_categories(industry, positioning):
     for keys, venues in CONSUMER_VENUES:
         if any(k in blob for k in keys):
             cats.extend(v for v in venues if v not in cats)
-        if len(cats) >= 6:
+        if len(cats) >= 8:
             break
-    return cats[:6] if cats else GENERIC_VENUES
+    return cats[:8] if cats else GENERIC_VENUES
 
 
 # A search result title like "10 Best Coaching Institutes in HSR Layout —
@@ -1329,9 +1535,16 @@ _VENUE_NOISE = re.compile(
     r"home|about us|about|contact us|contact|blog|blogs|categor(?:y|ies)|"
     r"community|coliving|job search|career growth|career\s+and\s+education|"
     r"city life|faqs?|privacy policy|terms|sitemap|subscribe|newsletter|"
-    r"sign up|sign in|login|register|follow us|social media|share|"
-    r"related posts?|recent posts?|popular posts?|tags?|archive|search|"
-    r"menu|navigation|team building|casino|games?|"
+    r"sign up|sign in|log\s*in|login|register|follow us|social media|share|"
+    r"welcome to|your account|tour package|"
+    r"related posts?|related articles?|recent posts?|popular posts?|tags?|"
+    r"archive|search|menu|navigation|team building|casino|games?|"
+    # section-header prose from inside a listicle article, not a business
+    # name — a real run scraping a mall roundup mined "Journey Through
+    # Maharashtra's Hidden Gems" and "Massive Scale & Variety: Central
+    # Suburbs" (a subheading grouping several venues, not one itself) as if
+    # they were venues.
+    r"journey through|hidden gems|massive scale|"
     # promotional/nav copy seen in a real run scraping a booking-site
     # listing page ("Popular Places in Bangalore", "Alternatives to
     # Hostels in Bangalore?", "Other Locations in India", "Hostels in
@@ -1369,7 +1582,39 @@ def _has_nearby_description(tag, min_len=40):
     return any(len(c.get_text(" ", strip=True)) >= min_len for c in candidates)
 
 
-def _mine_venue_names(soup, cat, location, max_names=8):
+# Generic category nouns, not specific business names — "Boutiques /" (a
+# fragment of an h2 like "Boutiques / Independent Labels") mined down to
+# just "Boutiques" and passed every other filter, since it doesn't equal
+# the CURRENT category label verbatim. Catches the generic noun regardless
+# of which of the many venue-category labels happens to be active.
+_GENERIC_VENUE_NOUNS = {
+    "boutique", "boutiques", "store", "stores", "shop", "shops", "mall",
+    "malls", "market", "markets", "restaurant", "restaurants", "cafe",
+    "cafes", "outlet", "outlets", "brand", "brands", "label", "labels",
+}
+_PROSE_STOPWORDS = {"and", "or", "of", "the", "a", "an", "to", "for", "with", "in", "on", "at"}
+
+
+def _looks_like_prose(cand):
+    """A real venue name is Title Case ("Palladium Mall, Lower Parel"); a
+    listicle's descriptive filler ("Great variety of food courts and dining
+    options", "Vibrant café scene, food joints, and sit-down restaurants")
+    reads as a lowercase sentence with one capitalized lead-in word. Neither
+    the noise-word blocklist above nor _has_nearby_description catches
+    these — a real run mined both verbatim as "venues" because they're
+    short enough, sit in an h2/li, and do have a following paragraph.
+    Require most non-stopword words to be capitalized."""
+    words = cand.split()
+    if len(words) < 3:
+        return False
+    content = [w for w in words if w.strip(",.-").lower() not in _PROSE_STOPWORDS]
+    if not content:
+        return False
+    capitalized = sum(1 for w in content if w[:1].isupper())
+    return capitalized / len(content) < 0.5
+
+
+def _mine_venue_names(soup, cat, location, max_names=12):
     """Pull real business names out of a listicle/directory page's headings
     and list items — mirrors _mine_candidates' heading-scrape approach for
     competitor "alternatives" pages."""
@@ -1382,7 +1627,13 @@ def _mine_venue_names(soup, cat, location, max_names=8):
             continue
         m = _NUMBERED.match(line)
         cand = (m.group(1) if m else line)
-        cand = re.split(r"[|–—]", cand)[0].strip(" .,:-")
+        # _NUMBERED only matches when the ENTIRE line fits its restricted
+        # charset (no commas) — "3. Mangaldas Market, Lohar Chawl" has a
+        # comma so the match fails outright and `line` (still "3. ...")
+        # falls through unstripped. Strip the leading "N. "/"N) " listicle
+        # marker unconditionally instead of depending on that full match.
+        cand = re.sub(r"^\d+[.)]\s*", "", cand)
+        cand = re.split(r"[|/–—]", cand)[0].strip(" .,:-")
         # Fold stylized unicode (mathematical bold/italic letters etc, a
         # common trick to dodge plain-text filters — a real run had
         # "𝐁𝐨𝐨𝐤 𝐰𝐢𝐭𝐡 𝐅𝐑𝐄𝐄") back to plain ASCII before any filter runs.
@@ -1390,6 +1641,8 @@ def _mine_venue_names(soup, cat, location, max_names=8):
         if not (3 <= len(cand) <= 60) or len(cand.split()) > 8:
             continue
         if _VENUE_NOISE.search(cand) or _VENUE_NUMERIC_NOISE.search(cand):
+            continue
+        if _looks_like_prose(cand):
             continue
         # A phrase describing the location/category itself, not a specific
         # business ("Hostels in Bangalore from Just $4", "Popular Places in
@@ -1402,6 +1655,8 @@ def _mine_venue_names(soup, cat, location, max_names=8):
         # real business name ("Coaching Institutes", "HSR Layout")
         if cl == cat_l or cl == loc_l or cl in (cat_l + "s", cat_l + "es"):
             continue
+        if cl in _GENERIC_VENUE_NOUNS:
+            continue
         if cl in seen:
             continue
         if not _has_nearby_description(tag):
@@ -1413,7 +1668,7 @@ def _mine_venue_names(soup, cat, location, max_names=8):
     return names
 
 
-def find_b2c_venues(company, industry, positioning, location, max_venues=30):
+def find_b2c_venues(company, industry, positioning, location, max_venues=50):
     """Public businesses the target audience visits — partnership/ad-outreach
     targets, geo-targeted when a location is given. Most SERP hits for these
     queries are "best/top N" listicles, so those get fetched and mined for
@@ -1428,13 +1683,15 @@ def find_b2c_venues(company, industry, positioning, location, max_venues=30):
     cats = venue_categories(industry, positioning)
     loc_suffix = f" in {location}" if location else ""
     venues, seen, sources = [], set(), []
-    per_cat = max(4, max_venues // max(len(cats), 1) + 1)
+    per_cat = max(6, max_venues // max(len(cats), 1) + 2)
     for cat in cats:
         if len(venues) >= max_venues or out_of_time():
             break
-        # One query per category (was two) — halves this section's search
-        # volume; "best" reliably surfaces listicles worth mining.
-        queries = [f"best {cat.lower()}{loc_suffix}"]
+        # Back to two query phrasings per category (was cut to one) — "best"
+        # and "top" surface different listicle sets on most search engines,
+        # and this section was the single biggest source of "very few B2C
+        # leads" complaints. The extra query cost is worth it here.
+        queries = [f"best {cat.lower()}{loc_suffix}", f"top {cat.lower()}{loc_suffix}"]
         got, fetched = 0, 0
         for q in queries:
             if got >= per_cat or len(venues) >= max_venues:
@@ -1443,7 +1700,7 @@ def find_b2c_venues(company, industry, positioning, location, max_venues=30):
                 if got >= per_cat or len(venues) >= max_venues:
                     break
                 if _LISTICLE_TITLE.search(r["title"]):
-                    if fetched >= 3 or out_of_time():
+                    if fetched >= 5 or out_of_time():
                         continue
                     _, soup = fetch_page_text(r["url"])
                     fetched += 1
@@ -1494,14 +1751,59 @@ def find_b2c_venues(company, industry, positioning, location, max_venues=30):
                 })
                 sources.append(r["url"])
                 got += 1
+    _enrich_venue_contacts(venues, location)
     return venues, sources
 
 
-def find_b2c_individuals(company, industry, positioning, location, max_leads=20):
+def _enrich_venue_contacts(venues, location, max_enrich=18):
+    """Venues mined from inside a listicle article (the majority of them —
+    see _mine_venue_names) have no per-item URL, so they always came back
+    with phone/email/website all empty: not actually contactable, which
+    defeats the point of calling them "leads." One targeted follow-up
+    search per venue — bounded to the first several, to keep this section's
+    time budget sane — finds the venue's own site/listing when the live web
+    has one. Mutates venues in place."""
+    enriched = 0
+    for v in venues:
+        if enriched >= max_enrich or out_of_time():
+            break
+        if v["contact"]["website"]:
+            continue  # already has one, from the single-business search path
+        loc_q = f" {location}" if location else ""
+        # Curly vs straight apostrophe mismatch silently killed every match
+        # for "NATURE'S BASKET" in a real run — the mined name uses a
+        # typographic apostrophe (') from the source page's HTML, but
+        # search-result snippets almost always use a plain ASCII one ('),
+        # so a literal substring check never found it despite 5 real
+        # results coming back for the exact query. Normalize both sides.
+        def _norm_apos(s):
+            return s.replace("’", "'").replace("‘", "'")
+        name_key = _norm_apos(v["name"].split(",")[0].strip().lower())
+        for r in web_search(f'"{v["name"]}"{loc_q}', 5):
+            dom = urlparse(r["url"]).netloc.lower()
+            if any(d in dom for d in DIRECTORY_DOMAINS):
+                continue
+            blob = _norm_apos((r["title"] + " " + r["snippet"]).lower())
+            if name_key[:12] not in blob:
+                continue  # off-target result, not actually about this venue
+            email_m = _EMAIL_RE.search(r["title"] + " " + r["snippet"])
+            phone_m = _PHONE_RE.search(r["title"] + " " + r["snippet"])
+            v["contact"]["website"] = r["url"]
+            if email_m:
+                v["contact"]["email"] = email_m.group(0)
+            if phone_m:
+                v["contact"]["phone"] = phone_m.group(0)
+            break
+        enriched += 1
+
+
+def find_b2c_individuals(company, industry, positioning, location, max_leads=30):
     """Best-effort public creator/community contacts who self-publish an
     email in their bio — never fabricated, kept strictly to what's actually
     indexed. Availability of public self-published contacts is the limit,
-    not the code, so this is intentionally lower-volume than venue leads."""
+    not the code, so this stays lower-volume than venue leads — but the old
+    3-query, single-phrasing set was leaving most of that available surface
+    unsearched, which is why this was consistently the thinnest section."""
     # Must be a short noun phrase, not the site's own tagline sentence — a
     # real run showed `positioning["h1"]` was "For Students and Parents who
     # demand the best Test Prep", and quoting that whole sentence in a
@@ -1510,10 +1812,20 @@ def find_b2c_individuals(company, industry, positioning, location, max_leads=20)
     niche = industry.strip()
     loc_suffix = f" {location}" if location else ""
     leads, seen, sources = [], set(), []
+    # Wider phrasing + platform coverage — Instagram/YouTube bios use very
+    # different conventions ("DM/email for collabs" vs "Business inquiries:")
+    # so more phrasings surface genuinely different indexed pages, not just
+    # re-ranked duplicates of the same three queries.
     queries = [
         f'site:instagram.com "{niche}"{loc_suffix} email',
         f'"{niche}"{loc_suffix} collab email instagram',
         f'"{niche}" creator{loc_suffix} contact email',
+        f'site:instagram.com "{niche}"{loc_suffix} business inquiries',
+        f'site:youtube.com "{niche}"{loc_suffix} business email',
+        f'"{niche}" influencer{loc_suffix} contact email',
+        f'"{niche}" blogger{loc_suffix} email contact',
+        f'site:twitter.com "{niche}"{loc_suffix} email',
+        f'"{niche}" community{loc_suffix} email contact',
     ]
     for q in queries:
         if len(leads) >= max_leads or out_of_time():
