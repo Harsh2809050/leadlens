@@ -76,13 +76,21 @@ def _section_deadline(t_start, section):
 
 
 def run_research(company: str, industry: str, location: str = "",
-                  industry_confident: bool = True) -> dict:
-    """Full live research pipeline. Returns the complete payload."""
+                  industry_confident: bool = True, positioning: dict = None,
+                  target_domain: str = None) -> dict:
+    """Full live research pipeline. Returns the complete payload.
+
+    positioning/target_domain are pre-filled when the search was started
+    from a URL (see resolve_target below) — skips the "{company} official
+    website" search entirely (one fewer query, one fewer chance of picking
+    the wrong company's site) and gives find_competitors a domain to
+    anchor its verification against."""
     sources = []
     t_start = time.time()
     research.reset_run_stats()
 
-    positioning = research.get_positioning(company, industry)
+    if positioning is None:
+        positioning = research.get_positioning(company, industry)
     if positioning.get("website"):
         sources.append(positioning["website"])
 
@@ -94,7 +102,8 @@ def run_research(company: str, industry: str, location: str = "",
 
     _section_deadline(t_start, "competitors")
     competitors, comp_sources = research.find_competitors(
-        company, industry, industry_confident=industry_confident)
+        company, industry, industry_confident=industry_confident,
+        target_domain=target_domain)
     sources.extend(comp_sources)
 
     _section_deadline(t_start, "leads")
@@ -209,24 +218,59 @@ def run_research(company: str, industry: str, location: str = "",
     }
 
 
+def resolve_target(company: str, url: str):
+    """Turn either a typed company name or a pasted URL into
+    (company_name, positioning_or_None, target_domain_or_None).
+
+    URL wins when given — it's the fix for "it gets confused between
+    companies": a typed name like "Military" or a real company name shared
+    by multiple businesses is ambiguous by construction, and every
+    downstream check (industry detection, competitor verification, own-
+    person exclusion) was guessing off that ambiguous text. A URL points at
+    exactly one company, so resolve_from_url derives the display name,
+    positioning, AND a canonical domain from the page itself — no guessing,
+    and one fewer "{company} official website" search per run."""
+    url = (url or "").strip()
+    if url:
+        name, positioning, domain = research.resolve_from_url(url)
+        if not domain:
+            raise HTTPException(
+                status_code=422,
+                detail="Couldn't reach that URL — check it's correct (e.g. "
+                       "https://example.com) and try again.",
+            )
+        return name, positioning, domain
+    return (company or "").strip(), None, None
+
+
 def get_or_research(company: str, industry: str, location: str = "",
-                    refresh: bool = False) -> dict:
-    company = (company or "").strip()
+                    refresh: bool = False, url: str = "",
+                    _resolved: tuple = None) -> dict:
+    # _resolved lets a caller that already ran resolve_target (e.g.
+    # api_search_start, which needs the resolved name before it can even
+    # compute the background job's cache key) pass it straight through
+    # instead of re-resolving — resolving means an extra page fetch, so
+    # doing it twice per run is pure waste.
+    if _resolved is not None:
+        company, positioning, target_domain = _resolved
+    else:
+        company, positioning, target_domain = resolve_target(company, url)
     industry = (industry or "").strip()
     location = (location or "").strip()
     if not company:
-        raise HTTPException(status_code=422, detail="company is required")
+        raise HTTPException(status_code=422, detail="company or url is required")
 
     # No industry given: reuse any cached research for this company,
     # otherwise auto-detect it — the company's own website is read first
-    # because it is the strongest signal of what they actually sell.
+    # because it is the strongest signal of what they actually sell (already
+    # fetched above if a URL was given — no need to fetch it twice).
     industry_confident = True
     if not industry:
         if not refresh:
             cached = db.find_by_company(company, location)
             if cached:
                 return cached
-        pos = research.get_positioning(company, "")
+        pos = positioning if positioning is not None else research.get_positioning(company, "")
         industry, industry_confident = research.detect_industry(company, pos)
 
     key = db.make_key(company, industry, location)
@@ -242,7 +286,8 @@ def get_or_research(company: str, industry: str, location: str = "",
             if cached:
                 return cached
         try:
-            data = run_research(company, industry, location, industry_confident)
+            data = run_research(company, industry, location, industry_confident,
+                                positioning=positioning, target_domain=target_domain)
         except Exception:
             traceback.print_exc()
             raise HTTPException(status_code=500,
@@ -271,9 +316,10 @@ def get_or_research(company: str, industry: str, location: str = "",
 
 
 @app.get("/api/search")
-def api_search(company: str = Query(...), industry: str = Query(""),
-               location: str = Query(""), refresh: int = 0):
-    return get_or_research(company, industry, location, refresh == 1)
+def api_search(company: str = Query(""), industry: str = Query(""),
+               location: str = Query(""), refresh: int = 0,
+               url: str = Query("")):
+    return get_or_research(company, industry, location, refresh == 1, url=url)
 
 
 # ---- async start/poll ------------------------------------------------
@@ -297,31 +343,39 @@ def _job_key(company, location):
 
 
 @app.get("/api/search/start")
-def api_search_start(company: str = Query(...), industry: str = Query(""),
-                     location: str = Query(""), refresh: int = 0):
-    company = (company or "").strip()
+def api_search_start(company: str = Query(""), industry: str = Query(""),
+                     location: str = Query(""), refresh: int = 0,
+                     url: str = Query("")):
     location = (location or "").strip()
     industry = (industry or "").strip()
-    if not company:
-        raise HTTPException(status_code=422, detail="company is required")
+    if not (company or "").strip() and not (url or "").strip():
+        raise HTTPException(status_code=422, detail="company or url is required")
+
+    # Resolve once, here, before anything else — a URL needs a single page
+    # fetch to turn into a company name, and every caller downstream
+    # (cache check, job key, background worker) needs that SAME resolved
+    # name, so resolving twice would double the page fetches for nothing.
+    resolved = resolve_target(company, url)
+    resolved_company = resolved[0]
 
     if not refresh:
-        cached = (db.find_by_company(company, location) if not industry
-                  else db.get_cached(company, industry, location))
+        cached = (db.find_by_company(resolved_company, location) if not industry
+                  else db.get_cached(resolved_company, industry, location))
         if cached:
-            return {"status": "done", "data": cached}
+            return {"status": "done", "data": cached, "company": resolved_company}
 
-    jkey = _job_key(company, location)
+    jkey = _job_key(resolved_company, location)
     with _jobs_guard:
         existing = _jobs.get(jkey)
         if existing and existing["status"] == "running":
-            return {"status": "started"}
+            return {"status": "started", "company": resolved_company}
         _jobs[jkey] = {"status": "running", "data": None, "detail": None,
                        "started_at": time.time()}
 
     def _worker():
         try:
-            data = get_or_research(company, industry, location, refresh == 1)
+            data = get_or_research(resolved_company, industry, location, refresh == 1,
+                                   _resolved=resolved)
             with _jobs_guard:
                 _jobs[jkey] = {"status": "done", "data": data,
                                "detail": None, "started_at": time.time()}
@@ -336,7 +390,7 @@ def api_search_start(company: str = Query(...), industry: str = Query(""),
                                "detail": str(e), "started_at": time.time()}
 
     threading.Thread(target=_worker, daemon=True).start()
-    return {"status": "started"}
+    return {"status": "started", "company": resolved_company}
 
 
 @app.get("/api/search/poll")
@@ -351,25 +405,28 @@ def api_search_poll(company: str = Query(...), location: str = Query("")):
 
 
 @app.get("/api/competitors")
-def api_competitors(company: str = Query(...), industry: str = Query(""),
-                    location: str = Query(""), refresh: int = 0):
-    data = get_or_research(company, industry, location, refresh == 1)
+def api_competitors(company: str = Query(""), industry: str = Query(""),
+                    location: str = Query(""), refresh: int = 0,
+                    url: str = Query("")):
+    data = get_or_research(company, industry, location, refresh == 1, url=url)
     return {"company": data["company"], "industry": data["industry"],
             "cached": data["cached"], "competitors": data["competitors"]}
 
 
 @app.get("/api/leads")
-def api_leads(company: str = Query(...), industry: str = Query(""),
-              location: str = Query(""), refresh: int = 0):
-    data = get_or_research(company, industry, location, refresh == 1)
+def api_leads(company: str = Query(""), industry: str = Query(""),
+              location: str = Query(""), refresh: int = 0,
+              url: str = Query("")):
+    data = get_or_research(company, industry, location, refresh == 1, url=url)
     return {"company": data["company"], "industry": data["industry"],
             "cached": data["cached"], "leads": data["leads"]}
 
 
 @app.get("/api/report")
-def api_report(company: str = Query(...), industry: str = Query(""),
-               location: str = Query(""), refresh: int = 0):
-    data = get_or_research(company, industry, location, refresh == 1)
+def api_report(company: str = Query(""), industry: str = Query(""),
+               location: str = Query(""), refresh: int = 0,
+               url: str = Query("")):
+    data = get_or_research(company, industry, location, refresh == 1, url=url)
     return {"company": data["company"], "industry": data["industry"],
             "cached": data["cached"], "report": data["report"]}
 

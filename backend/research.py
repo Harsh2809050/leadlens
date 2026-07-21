@@ -875,7 +875,7 @@ def _wikipedia_extract(company):
 
 
 def find_competitors(company, industry, max_competitors=12, progress=None,
-                      industry_confident=True):
+                      industry_confident=True, target_domain=None):
     # Expanded from 5 to 9 queries — the old set was consistently starving
     # the mining stage of raw evidence, which is the root cause of "gives
     # leads but very few" competitors: verify_competitor can only confirm
@@ -963,7 +963,7 @@ def find_competitors(company, industry, max_competitors=12, progress=None,
         if len(competitors) >= max_competitors or out_of_time():
             break
         verified, desc, website = verify_competitor(
-            name, company, industry, mining_score=score)
+            name, company, industry, mining_score=score, target_domain=target_domain)
         print(f"[verify] {name}: {'OK' if verified else 'dropped'}", flush=True)
         if not verified:
             continue
@@ -1010,7 +1010,7 @@ def find_competitors(company, industry, max_competitors=12, progress=None,
             if score < 3 or name.lower() in seen:
                 continue
             verified, desc, website = verify_competitor(
-                name, company, industry, require_vs=False)
+                name, company, industry, require_vs=False, target_domain=target_domain)
             print(f"[verify/cat] {name}: {'OK' if verified else 'dropped'}",
                   flush=True)
             if verified:
@@ -1057,7 +1057,8 @@ def _same_domain(desc, industry, company, strict=False):
 HIGH_CONFIDENCE_MINING_SCORE = 12
 
 
-def verify_competitor(name, company, industry, require_vs=True, mining_score=0):
+def verify_competitor(name, company, industry, require_vs=True, mining_score=0,
+                      target_domain=None):
     """A candidate only counts if the live web shows real head-to-head
     evidence: a '<name> vs <company>' title or an 'alternative to <company>'
     context — AND its description matches the industry. With require_vs=False
@@ -1065,6 +1066,15 @@ def verify_competitor(name, company, industry, require_vs=True, mining_score=0):
     nl, cl = name.lower(), company.lower()
     if not require_vs and is_mega_cap(name):
         return False, "", ""
+    # A candidate whose own name is basically the target's own brand slug
+    # (e.g. mining picked up "Cult Fit" as a "competitor" of "Cult.fit") is
+    # the same company, not a rival — cheap check using the resolved domain
+    # when we have one (URL-targeted search), before any network calls.
+    if target_domain:
+        target_slug = target_domain.split(".")[0].replace("-", "")
+        name_slug = re.sub(r"[^a-z0-9]", "", nl)
+        if target_slug and len(target_slug) >= 4 and target_slug == name_slug:
+            return False, "", ""
     vs_pat = re.compile(
         r"(?:{n}.{{0,30}}\b(?:vs|versus)\b\.?.{{0,30}}{c}|"
         r"{c}.{{0,30}}\b(?:vs|versus)\b\.?.{{0,30}}{n})"
@@ -1131,6 +1141,8 @@ def verify_competitor(name, company, industry, require_vs=True, mining_score=0):
 
     for r in rs2:
         dom = urlparse(r["url"]).netloc.lower().replace("www.", "")
+        if target_domain and dom == target_domain:
+            continue  # this "evidence" is actually the target's own site
         if nl in r["title"].lower() and r["snippet"]:
             snip = _clean_snip(r["snippet"])
             if not desc and len(snip) > 60 and _COMPANYISH.search(snip):
@@ -1163,6 +1175,8 @@ def verify_competitor(name, company, industry, require_vs=True, mining_score=0):
         # when require_vs already gave us strong head-to-head evidence.
         for r in rs2:
             dom = urlparse(r["url"]).netloc.lower().replace("www.", "")
+            if target_domain and dom == target_domain:
+                continue
             if not any(d in dom for d in DIRECTORY_DOMAINS):
                 website = "https://" + dom
                 break
@@ -1918,6 +1932,61 @@ def find_b2c_individuals(company, industry, positioning, location, max_leads=30)
 # --------------------------------------------------------------------------
 # Positioning & industry trends
 # --------------------------------------------------------------------------
+
+def resolve_from_url(url):
+    """Resolve the target company DIRECTLY from its website URL instead of
+    guessing from a typed name. This is the fix for "it gets confused
+    between companies" — a bare name like "Military" or "Career" or even a
+    real company name shared by multiple unrelated businesses has no way to
+    disambiguate itself, so every downstream text-match (competitor
+    verification, own-person exclusion, positioning lookup) is guessing. A
+    URL is unambiguous: there is exactly one company at that domain.
+
+    Also removes one full web_search call per run (the old flow searched
+    "{company} official website" and then had to guess which result was
+    really theirs) — one less query is one less chance of getting rate-
+    limited, and one less chance of picking the wrong site entirely.
+
+    Returns (company_name, positioning, domain) or (None, None, None) if the
+    URL can't be reached at all.
+    """
+    u = (url or "").strip()
+    if not u:
+        return None, None, None
+    if not re.match(r"^https?://", u, re.I):
+        u = "https://" + u
+    domain = urlparse(u).netloc.lower().replace("www.", "")
+    if not domain or "." not in domain:
+        return None, None, None
+    text, soup = fetch_page_text(u)
+    positioning = {"website": u, "tagline": "", "description": "", "h1": ""}
+    slug = domain.split(".")[0]
+    company = slug.replace("-", " ").title()
+    if soup is not None:
+        if soup.title:
+            title = soup.title.get_text(strip=True)
+            positioning["tagline"] = title[:160]
+            # A page title is usually "Brand Name - Tagline" or "Brand | Tagline"
+            # — the first clean segment is almost always the real brand name,
+            # and a better display name than a mechanical domain-slug guess
+            # (keeps real capitalization/punctuation like "Cult.fit").
+            first_seg = re.split(r"[-|–—:]", title)[0].strip()
+            if 2 <= len(first_seg) <= 40:
+                company = first_seg
+        meta = soup.find("meta", attrs={"name": "description"}) or soup.find(
+            "meta", attrs={"property": "og:description"})
+        if meta and meta.get("content"):
+            positioning["description"] = meta["content"][:300]
+        h1 = soup.find("h1")
+        if h1:
+            positioning["h1"] = h1.get_text(" ", strip=True)[:160]
+    if not (positioning["tagline"] or positioning["description"] or positioning["h1"]):
+        # The page genuinely couldn't be read (dead URL, blocked scrape,
+        # typo) — still return the domain-derived name so the pipeline can
+        # proceed, but callers should know this is a weaker signal.
+        pass
+    return company, positioning, domain
+
 
 def get_positioning(company, industry):
     """What the company says about itself (title/meta/h1 of its own site)."""
