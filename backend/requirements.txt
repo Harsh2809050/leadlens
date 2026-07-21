@@ -3,3 +3,10 @@ uvicorn[standard]>=0.29
 httpx>=0.27
 beautifulsoup4>=4.12
 ddgs>=9.0
+# Brave Search's HTML responses are brotli-compressed. Without this package
+# httpx can't decode them at all and every Brave request fails with
+# "DecodingError: brotli: decoder failed" — found live via /api/diag, where
+# Brave was the only engine failing with an actual exception (every other
+# broken engine just came back empty, no error). This restores a real
+# working engine for free, no code change needed beyond the dependency.
+brotli>=1.1
