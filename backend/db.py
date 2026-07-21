@@ -44,7 +44,47 @@ def _conn():
         )
         """
     )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS engine_state (
+            engine      TEXT PRIMARY KEY,
+            cooldown_until REAL NOT NULL,
+            ts          REAL NOT NULL
+        )
+        """
+    )
     return conn
+
+
+def get_engine_cooldowns():
+    """Per-engine rate-limit cooldown timestamps, persisted so a server
+    restart doesn't forget which engines are currently benched — every
+    restart used to re-pay the ~30s 'discover which engines are dead' tax
+    from scratch, even seconds after the previous process had already
+    figured it out."""
+    conn = _conn()
+    try:
+        now = time.time()
+        rows = conn.execute(
+            "SELECT engine, cooldown_until FROM engine_state WHERE cooldown_until > ?",
+            (now,),
+        ).fetchall()
+        return {engine: until for engine, until in rows}
+    finally:
+        conn.close()
+
+
+def save_engine_cooldown(engine: str, cooldown_until: float):
+    conn = _conn()
+    try:
+        conn.execute(
+            "INSERT OR REPLACE INTO engine_state (engine, cooldown_until, ts) "
+            "VALUES (?, ?, ?)",
+            (engine, cooldown_until, time.time()),
+        )
+        conn.commit()
+    finally:
+        conn.close()
 
 
 SERP_CACHE_MAX_AGE = 14 * 24 * 3600  # 14 days
