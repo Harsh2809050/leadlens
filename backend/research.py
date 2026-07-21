@@ -633,6 +633,8 @@ INDUSTRY_TAXONOMY = [
     ("energy", ("energy company", "renewable energy", "solar energy")),
     ("telecommunications", ("telecom operator", "telecommunications", "mobile network operator")),
     ("saas", ("saas platform", "software as a service", "b2b software")),
+    ("fitness and wellness", ("fitness", "gym", "workout", "wellness app",
+                              "wellness platform", "sports and fitness")),
 ]
 
 
@@ -658,7 +660,7 @@ _IND_PAT = re.compile(
 
 _IS_A_PAT = re.compile(
     r"\bis an? ([a-z][a-z ,/&\-]{4,70}?)(?:\.|,| that| which| developed| founded|"
-    r" headquartered| based| owned| primarily| used )", re.I)
+    r" headquartered| based| owned| primarily| used | offering| providing)", re.I)
 
 
 def detect_industry(company, positioning=None):
@@ -683,7 +685,7 @@ def detect_industry(company, positioning=None):
     own_anchored = re.compile(
         r"\bis an? ([a-z][a-z ,/&\-]{4,70}?)"
         r"(?:\.|,| that| which| developed| founded| headquartered| based|"
-        r" owned| primarily| used |$)", re.I)
+        r" owned| primarily| used | offering| providing|$)", re.I)
     m = own_anchored.search(own)
     if m:
         phrase = re.sub(r"\s+", " ", m.group(1)).strip(" -,.")
@@ -709,7 +711,7 @@ def detect_industry(company, positioning=None):
     anchored = re.compile(
         re.escape(company) + r"[^.]{0,50}?\bis an? ([a-z][a-z ,/&\-]{4,70}?)"
         r"(?:\.|,| that| which| developed| founded| headquartered| based|"
-        r" owned| primarily| used )", re.I)
+        r" owned| primarily| used | offering| providing)", re.I)
     for r in rs:
         m = anchored.search(r["title"] + ". " + r["snippet"])
         if m:
@@ -1025,15 +1027,31 @@ _COMPANYISH = re.compile(
     r"design|saas|cloud|service|product|enterprise|workspace|collaborat)", re.I)
 
 
-def _same_domain(desc, industry, company):
+def _same_domain(desc, industry, company, strict=False):
     """The candidate's description must actually mention the industry (or the
     target company). Kills cross-domain junk like a 3D render engine showing
-    up as a food-delivery competitor."""
+    up as a food-delivery competitor.
+
+    strict=True requires TWO independent industry tokens to hit, not one —
+    used for the category-fallback path (require_vs=False), which has no
+    real head-to-head evidence at all. A single generic token match let
+    obvious junk through in a real run: "Military" (military.com, an
+    unrelated health-insurance-claims article) was accepted as a Cult.fit
+    competitor purely because its snippet happened to contain the word
+    "health" — one of the industry's own generic tokens — with nothing else
+    industry-relevant anywhere in the text. Requiring two independent hits
+    makes a coincidental single-word match much harder to satisfy by luck,
+    while a real same-industry description naturally uses several relevant
+    terms together."""
     d = desc.lower()
     if company.lower() in d:
         return True
     toks = [t for t in re.split(r"[^a-z]+", industry.lower()) if len(t) > 3]
-    return any(t[:6] in d for t in toks) if toks else True
+    if not toks:
+        return True
+    hits = sum(1 for t in toks if t[:6] in d)
+    need = 2 if (strict and len(toks) >= 2) else 1
+    return hits >= need
 
 
 HIGH_CONFIDENCE_MINING_SCORE = 12
@@ -1158,7 +1176,8 @@ def verify_competitor(name, company, industry, require_vs=True, mining_score=0):
         # in as fake "competitors". Also require an actual matching website
         # domain: real companies almost always have one; generic words and
         # exam acronyms essentially never do.
-        ok = bool(desc) and bool(website) and _same_domain(desc, industry, company)
+        ok = (bool(desc) and bool(website)
+              and _same_domain(desc, industry, company, strict=True))
     return ok, desc, website
 
 
@@ -1209,6 +1228,10 @@ BUYER_PERSONAS = [
       "Head of Revenue Management"]),
     (("hr", "recruit", "talent", "hiring", "people"),
      ["HR Director", "Talent Acquisition Manager", "Head of People"]),
+    (("fitness", "gym", "wellness app", "wellness platform", "workout",
+      "sports and fitness"),
+     ["Corporate Wellness Manager", "Head of People", "HR Director",
+      "Office Administrator", "Employee Benefits Manager"]),
 ]
 
 GENERIC_BUYERS = ["Head of Operations", "Procurement Manager",
@@ -1550,11 +1573,31 @@ _VENUE_NOISE = re.compile(
     # Hostels in Bangalore?", "Other Locations in India", "Hostels in
     # Bangalore from Just $4")
     r"popular places|other locations|alternatives?\s+to|from\s+just|"
-    r"book\s+now|book\s+with|\d+%\s*off|discount|\bdeals?\b|\boffers?\b)\b",
+    r"book\s+now|book\s+with|\d+%\s*off|discount|\bdeals?\b|\boffers?\b|"
+    # Generic page-chrome/CTA/FAQ text pulled from a single-business page's
+    # OWN title (the direct, non-listicle path) rather than a listicle
+    # heading — a real run mining "best gym/yoga studio/nutrition store in
+    # Bangalore" returned "Our Team", "Get Started", "Find a Trainer!",
+    # "How to Book a Yoga Studio in Bangalore", "Does joining Gym help?",
+    # "Leave a Comment Cancel Reply", "Popular Localities near you for Gym"
+    # and "Monthly Fee for Group Classes" as if each were a real venue name —
+    # every one of these is marketplace/blog UI copy, not a business.
+    r"our team|day boarding|leave a comment|cancel reply|^archives?$|"
+    r"^how to\b|does\s+\w+\s+help|get started|get in touch|explore us|"
+    r"find a trainer|^find\b|popular localities|\bfee for\b|"
+    r"^(?:monthly|hourly|annual|weekly)\s+fee|recently leaked secret|"
+    r"secret to\b)\b",
     re.I)
+# A real business name is essentially never phrased as a question or bare
+# exclamation ("How to connect?", "Explore us!", "Get In Touch!") — those are
+# CTA/FAQ copy from a marketplace or blog page, not the business itself.
+_VENUE_QUESTION_OR_CTA = re.compile(r"[?!]\s*$")
 # A random statistic ("72% of businesses...") or a pricing line ("Xbox
 # Gaming: ₹100 per hour") is never a business name.
 _VENUE_NUMERIC_NOISE = re.compile(r"\d+\s*%|[₹$€£]\s*\d|\d\s*[₹$€£]")
+# A bare URL/path leaking through as a "name" ("wawa.com/locations/store-
+# locator") — no spaces at all but has a dot and a slash.
+_VENUE_URL_NOISE = re.compile(r"^\S+\.\w{2,4}/\S+$")
 
 
 def _clean_venue_name(title):
@@ -1641,6 +1684,8 @@ def _mine_venue_names(soup, cat, location, max_names=12):
         if not (3 <= len(cand) <= 60) or len(cand.split()) > 8:
             continue
         if _VENUE_NOISE.search(cand) or _VENUE_NUMERIC_NOISE.search(cand):
+            continue
+        if _VENUE_QUESTION_OR_CTA.search(cand) or _VENUE_URL_NOISE.match(cand):
             continue
         if _looks_like_prose(cand):
             continue
@@ -1732,7 +1777,20 @@ def find_b2c_venues(company, industry, positioning, location, max_venues=50):
                 name = _clean_venue_name(r["title"])
                 if not name or name.lower() in seen or _VENUE_NOISE.search(name):
                     continue
+                if _VENUE_QUESTION_OR_CTA.search(name) or _VENUE_URL_NOISE.match(name):
+                    continue
                 blob = r["title"] + " " + r["snippet"]
+                # Topical relevance guard: the result must actually be ABOUT
+                # this category, not just rank for the query text. A real run
+                # for "best yoga studio in Bangalore" returned a Zara page
+                # titled "Women's Tops" — completely unrelated to yoga, but
+                # it ranked for the query anyway. Require at least one
+                # meaningful word from the category name to appear in the
+                # result's own title/snippet.
+                cat_words = [w.lower() for w in re.split(r"[^A-Za-z]+", cat)
+                            if len(w) > 3]
+                if cat_words and not any(w in blob.lower() for w in cat_words):
+                    continue
                 email_m = _EMAIL_RE.search(blob)
                 phone_m = _PHONE_RE.search(blob)
                 seen.add(name.lower())
